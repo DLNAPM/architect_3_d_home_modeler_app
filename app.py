@@ -1,522 +1,78 @@
-"""
-Architect 3D Home Modeler — Flask App (single file)
-===================================================
-
-Features implemented per request:
-- Home page: describe home or upload an architectural design to "Generate House Plan".
-- After generation, creates 2 exterior renderings (Front / Back) and shows room categories.
-- Room categories include: Living Room, Kitchen, Home Office, Primary Bedroom, Primary Bathroom,
-  Bedroom2, Bedroom3, Family Room, Half Bath. If description mentions basement, also include:
-  Basement w/ Bar (Game Room), Theater Room, Exercise Room (Gym), Steam Room, Basement Hallway.
-- Each room has its own option panel (as specified) and can generate multiple renderings.
-- Users can select multiple renderings for bulk actions: Delete, Like, Favorite, Download (ZIP), Email.
-- Liked renderings can be downloaded and/or emailed (enforced by the bulk action endpoints).
-- When 2 or more Favorites exist for a project, a Slideshow button appears.
-- Basic auth with account registration/login. Likes/Favorites/Renderings are saved per user.
-- Rendering images are generated as placeholders with PIL (text-overlaid) but are pluggable for real AI.
-
-How to run (dev):
------------------
-1) Create and activate a virtualenv (recommended)
-   python -m venv .venv && source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
-2) Install deps:
-   pip install flask pillow python-dotenv
-3) (Optional) Configure email by creating a .env file in project root with values:
-   SMTP_HOST=your.smtp.host
-   SMTP_PORT=587
-   SMTP_USER=your_username
-   SMTP_PASSWORD=your_password
-   SENDER_EMAIL=your_from_address@example.com
-4) Run:
-   python app.py
-5) Visit: http://127.0.0.1:5000
-
-Notes:
-- This app writes its Jinja templates and minimal CSS/JS to ./templates and ./static on first run.
-- For production, use a proper WSGI server and persistent storage.
-- Replace the placeholder image generator with real AI model integration where noted.
-"""
-from __future__ import annotations
 import os
 import io
-import json
+import base64
 import zipfile
 import sqlite3
+from contextlib import closing
 from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Tuple
+from functools import wraps
 
 from flask import (
-    Flask, render_template, request, redirect, url_for, flash, session,
-    send_file, abort
+    Flask, request, redirect, url_for, render_template_string, session,
+    send_file, flash, jsonify, abort
 )
 from werkzeug.security import generate_password_hash, check_password_hash
-from PIL import Image, ImageDraw, ImageFont
-from dotenv import load_dotenv
-import smtplib
-from email.message import EmailMessage
 
+# --- OpenAI (Images) ---
+try:
+    from openai import OpenAI
+    openai_client = OpenAI()
+except Exception as e:  # Allow the app to boot even if SDK isn't installed yet
+    openai_client = None
 
+# -----------------------------
+# Config
+# -----------------------------
+APP_NAME = "Architect 3D Home Modeler"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(BASE_DIR, "architect3d.db")
+IMAGES_DIR = os.path.join(BASE_DIR, "static", "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
 
-# ------------------------------------------------------
-# Flask setup
-# ------------------------------------------------------
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SENDER_EMAIL = os.getenv("SENDER_EMAIL", SMTP_USER)
+
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
+
+# -----------------------------
+# Flask App
+# -----------------------------
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev_secret")
+app.secret_key = SECRET_KEY
 
-# ------------------------------------------------------
-# One-time initialization (Flask 3.x safe)
-# ------------------------------------------------------
-init_done = False
+# -----------------------------
+# DB Helpers
+# -----------------------------
+SCHEMA_SQL = r"""
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 
-@app.before_request
-def run_once_on_startup():
-    """Run one-time setup logic before the first request."""
-    global init_done
-    if not init_done:
-        print("Running one-time initialization...")
-
-        # Example: ensure static dirs exist
-        os.makedirs("static/renders", exist_ok=True)
-        os.makedirs("static/uploads", exist_ok=True)
-
-        init_done = True
-
-
-# ------------------------------------------------------------
-# Configuration
-# ------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "instance" / "architect3d.sqlite3"
-UPLOAD_DIR = BASE_DIR / "uploads"
-RENDER_DIR = BASE_DIR / "static" / "renderings"
-TEMPLATE_DIR = BASE_DIR / "templates"
-STATIC_DIR = BASE_DIR / "static"
-
-load_dotenv(BASE_DIR / ".env")
-
-app = Flask(__name__, template_folder=str(TEMPLATE_DIR), static_folder=str(STATIC_DIR))
-app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-me')
-app.config['MAX_CONTENT_LENGTH'] = 25 * 1024 * 1024  # 25MB upload limit
-
-# Email (optional)
-SMTP_HOST = os.environ.get('SMTP_HOST')
-SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
-SMTP_USER = os.environ.get('SMTP_USER')
-SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD')
-SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
-
-# ------------------------------------------------------------
-# Utility: ensure folders & templates exist
-# ------------------------------------------------------------
-
-def ensure_dirs_and_templates():
-    (BASE_DIR / "instance").mkdir(parents=True, exist_ok=True)
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    RENDER_DIR.mkdir(parents=True, exist_ok=True)
-    TEMPLATE_DIR.mkdir(parents=True, exist_ok=True)
-    (STATIC_DIR / "css").mkdir(parents=True, exist_ok=True)
-    (STATIC_DIR / "js").mkdir(parents=True, exist_ok=True)
-
-    # --- base.html ---
-    base_html = r"""{% macro nav() %}
-<nav class="navbar navbar-expand-lg navbar-dark bg-dark">
-  <div class="container-fluid">
-    <a class="navbar-brand" href="{{ url_for('index') }}">Architect 3D Home Modeler</a>
-    <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
-      <span class="navbar-toggler-icon"></span>
-    </button>
-    <div class="collapse navbar-collapse" id="navbarNav">
-      <ul class="navbar-nav me-auto mb-2 mb-lg-0">
-        {% if session.get('user_id') %}
-        <li class="nav-item"><a class="nav-link" href="{{ url_for('dashboard') }}">My Projects</a></li>
-        {% endif %}
-      </ul>
-      <ul class="navbar-nav">
-        {% if session.get('user_id') %}
-          <li class="nav-item"><span class="navbar-text me-3">Hi, {{ session.get('username') }}</span></li>
-          <li class="nav-item"><a class="nav-link" href="{{ url_for('logout') }}">Logout</a></li>
-        {% else %}
-          <li class="nav-item"><a class="nav-link" href="{{ url_for('login') }}">Login</a></li>
-          <li class="nav-item"><a class="nav-link" href="{{ url_for('register') }}">Register</a></li>
-        {% endif %}
-      </ul>
-    </div>
-  </div>
-</nav>
-{% endmacro %}
-
-<!doctype html>
-<html lang="en" data-bs-theme="dark">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ title or 'Architect 3D Home Modeler' }}</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-  <link href="{{ url_for('static', filename='css/app.css') }}" rel="stylesheet">
-</head>
-<body class="bg-black text-light">
-  {{ nav() }}
-  <main class="container py-4">
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% for category, message in messages %}
-          <div class="alert alert-{{ 'warning' if category=='error' else category }} alert-dismissible fade show" role="alert">
-            {{ message }}
-            <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-          </div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
-
-    {% block content %}{% endblock %}
-  </main>
-
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-  <script src="{{ url_for('static', filename='js/app.js') }}"></script>
-</body>
-</html>
+CREATE TABLE IF NOT EXISTS renderings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER NOT NULL,
+  title TEXT,
+  category TEXT NOT NULL, -- exterior_front, exterior_back, living_room, kitchen, etc
+  prompt TEXT NOT NULL,
+  image_path TEXT NOT NULL,
+  liked INTEGER DEFAULT 0,
+  favorited INTEGER DEFAULT 0,
+  created_at TEXT NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id)
+);
 """
-    (TEMPLATE_DIR / 'base.html').write_text(base_html, encoding='utf-8')
 
-    # --- index.html ---
-    index_html = r"""{% extends 'base.html' %}
-{% block content %}
-<div class="row g-4">
-  <div class="col-12 col-lg-7">
-    <div class="card shadow-lg border-0 bg-dark-subtle">
-      <div class="card-body">
-        <h3 class="card-title">Design your Dream Home with AI</h3>
-        <p class="text-muted">Describe your home or upload a plan. Click <strong>Generate House Plan</strong> to begin. Two exterior renderings (Front/Back) will be created automatically.</p>
-        <form method="post" action="{{ url_for('generate') }}" enctype="multipart/form-data">
-          <div class="mb-3">
-            <label class="form-label">Home Description</label>
-            <textarea class="form-control" name="description" rows="5" placeholder="e.g., 2-story modern farmhouse, 4 bedrooms, family room, basement with gym and theater..."></textarea>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Upload Architectural Design (optional)</label>
-            <input type="file" class="form-control" name="plan_file" accept="image/*,.pdf">
-          </div>
-          {% if not session.get('user_id') %}
-            <div class="alert alert-info">Create an account or log in to save your likes and favorites.</div>
-          {% endif %}
-          <button class="btn btn-primary btn-lg" type="submit">Generate House Plan</button>
-        </form>
-      </div>
-    </div>
-  </div>
-  <div class="col-12 col-lg-5">
-    <div class="card shadow-lg border-0 h-100 bg-dark-subtle">
-      <div class="card-body">
-        <h5>What you can do</h5>
-        <ul>
-          <li>Create multiple renderings for Exteriors and Rooms.</li>
-          <li>Select renderings to <strong>Delete</strong>, <strong>Like</strong>, <strong>Favorite</strong>, <strong>Download</strong>, or <strong>Email</strong>.</li>
-          <li><strong>Liked</strong> renderings can be downloaded or emailed.</li>
-          <li>When you have 2+ <strong>Favorites</strong> in a project, a <em>Slideshow</em> button appears.</li>
-        </ul>
-        <hr>
-        <p class="small text-muted mb-0">Reference app: <a href="#" class="link-light" onclick="alert('This demo is inspired by your reference.');return false;">provided link</a>.</p>
-      </div>
-    </div>
-  </div>
-</div>
-{% endblock %}
-"""
-    (TEMPLATE_DIR / 'index.html').write_text(index_html, encoding='utf-8')
+def init_db():
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.executescript(SCHEMA_SQL)
+        conn.commit()
 
-    # --- auth templates ---
-    login_html = r"""{% extends 'base.html' %}
-{% block content %}
-<div class="row justify-content-center">
-  <div class="col-12 col-md-6 col-lg-5">
-    <div class="card shadow-lg border-0 bg-dark-subtle">
-      <div class="card-body">
-        <h3 class="card-title">Login</h3>
-        <form method="post">
-          <div class="mb-3">
-            <label class="form-label">Email</label>
-            <input type="email" class="form-control" name="email" required>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Password</label>
-            <input type="password" class="form-control" name="password" required>
-          </div>
-          <button class="btn btn-primary" type="submit">Login</button>
-          <a class="btn btn-link" href="{{ url_for('register') }}">Create an account</a>
-        </form>
-      </div>
-    </div>
-  </div>
-</div>
-{% endblock %}
-"""
-    (TEMPLATE_DIR / 'login.html').write_text(login_html, encoding='utf-8')
-
-    register_html = r"""{% extends 'base.html' %}
-{% block content %}
-<div class="row justify-content-center">
-  <div class="col-12 col-md-6 col-lg-5">
-    <div class="card shadow-lg border-0 bg-dark-subtle">
-      <div class="card-body">
-        <h3 class="card-title">Register</h3>
-        <form method="post">
-          <div class="mb-3">
-            <label class="form-label">Username</label>
-            <input type="text" class="form-control" name="username" required>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Email</label>
-            <input type="email" class="form-control" name="email" required>
-          </div>
-          <div class="mb-3">
-            <label class="form-label">Password</label>
-            <input type="password" class="form-control" name="password" required>
-          </div>
-          <button class="btn btn-primary" type="submit">Create Account</button>
-        </form>
-      </div>
-    </div>
-  </div>
-</div>
-{% endblock %}
-"""
-    (TEMPLATE_DIR / 'register.html').write_text(register_html, encoding='utf-8')
-
-    # --- dashboard ---
-    dashboard_html = r"""{% extends 'base.html' %}
-{% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3">
-  <h3>Your Projects</h3>
-  <a class="btn btn-success" href="{{ url_for('index') }}">New Project</a>
-</div>
-{% if projects %}
-  <div class="row g-3">
-    {% for p in projects %}
-    <div class="col-12 col-md-6 col-lg-4">
-      <div class="card h-100 bg-dark-subtle border-0 shadow-sm">
-        <div class="card-body">
-          <h5>{{ p['title'] }}</h5>
-          <p class="small text-muted">Created {{ p['created_at'] }}</p>
-          <a class="btn btn-primary" href="{{ url_for('plan', project_id=p['id']) }}">Open</a>
-        </div>
-      </div>
-    </div>
-    {% endfor %}
-  </div>
-{% else %}
-  <div class="alert alert-secondary">No projects yet. Start a new one from the home page.</div>
-{% endif %}
-{% endblock %}
-"""
-    (TEMPLATE_DIR / 'dashboard.html').write_text(dashboard_html, encoding='utf-8')
-
-    # --- plan.html ---
-    plan_html = r"""{% extends 'base.html' %}
-{% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3">
-  <div>
-    <h3>Project: {{ project['title'] }}</h3>
-    <p class="text-muted small mb-0">{{ project['description'] or 'No description provided.' }}</p>
-  </div>
-  <div>
-    {% if favorites_count >= 2 %}
-      <a class="btn btn-warning" href="{{ url_for('slideshow', project_id=project['id']) }}">Slideshow ({{ favorites_count }})</a>
-    {% else %}
-      <button class="btn btn-secondary" disabled>Slideshow</button>
-    {% endif %}
-  </div>
-</div>
-
-<h5 class="mt-4">Exteriors</h5>
-<div class="row g-3 mb-4">
-  {% for exterior in exteriors %}
-  <div class="col-12 col-md-6 col-lg-4">
-    <div class="card h-100 bg-dark-subtle border-0 shadow-sm">
-      <img class="card-img-top" src="{{ url_for('static', filename='renderings/' ~ exterior['image_filename']) }}" alt="{{ exterior['title'] }}">
-      <div class="card-body">
-        <h5 class="card-title">{{ exterior['title'] }}</h5>
-        <a class="btn btn-outline-light" href="{{ url_for('room', project_id=project['id'], room_key=exterior['room_key']) }}">Open</a>
-      </div>
-    </div>
-  </div>
-  {% endfor %}
-</div>
-
-<h5>Rooms</h5>
-<div class="row g-3">
-  {% for room in rooms %}
-  <div class="col-12 col-md-6 col-lg-4">
-    <div class="card h-100 bg-dark-subtle border-0 shadow-sm">
-      <div class="card-body d-flex flex-column">
-        <h5 class="card-title">{{ room['title'] }}</h5>
-        <p class="small text-muted">Generate multiple renderings with different options.</p>
-        <div class="mt-auto">
-          <a class="btn btn-outline-primary" href="{{ url_for('room', project_id=project['id'], room_key=room['room_key']) }}">Open</a>
-        </div>
-      </div>
-    </div>
-  </div>
-  {% endfor %}
-</div>
-{% endblock %}
-"""
-    (TEMPLATE_DIR / 'plan.html').write_text(plan_html, encoding='utf-8')
-
-    # --- room.html ---
-    room_html = r"""{% extends 'base.html' %}
-{% block content %}
-<div class="d-flex justify-content-between align-items-center mb-3">
-  <h3>{{ room_title }}</h3>
-  <a class="btn btn-secondary" href="{{ url_for('plan', project_id=project['id']) }}">Back to Project</a>
-</div>
-
-<div class="card mb-4 bg-dark-subtle border-0 shadow-sm">
-  <div class="card-body">
-    <h5 class="mb-3">Generate a New Rendering</h5>
-    <form method="post" action="{{ url_for('generate_rendering', project_id=project['id'], room_key=room_key) }}">
-      <div class="row g-3">
-        {% for field in option_fields %}
-        <div class="col-12 col-md-6">
-          <label class="form-label">{{ field.label }}</label>
-          <input class="form-control" name="{{ field.name }}" placeholder="{{ field.placeholder }}">
-        </div>
-        {% endfor %}
-      </div>
-      <div class="mt-3">
-        <button class="btn btn-primary" type="submit">Generate Rendering</button>
-      </div>
-    </form>
-  </div>
-</div>
-
-<div class="card bg-dark-subtle border-0 shadow-sm">
-  <div class="card-body">
-    <div class="d-flex justify-content-between align-items-center mb-2">
-      <h5 class="mb-0">Your Renderings ({{ renderings|length }})</h5>
-      <form class="d-flex gap-2" method="post" action="{{ url_for('bulk_action', project_id=project['id'], room_key=room_key) }}">
-        <input type="hidden" name="selected_ids" id="selected_ids_input">
-        <button name="action" value="like" class="btn btn-outline-success" type="submit">Like</button>
-        <button name="action" value="favorite" class="btn btn-outline-warning" type="submit">Favorite</button>
-        <button name="action" value="delete" class="btn btn-outline-danger" type="submit" onclick="return confirm('Delete selected renderings?')">Delete</button>
-        <button name="action" value="download" class="btn btn-outline-light" type="submit">Download (ZIP)</button>
-        <button name="action" value="email" class="btn btn-outline-info" type="button" data-bs-toggle="modal" data-bs-target="#emailModal">Email</button>
-      </form>
-    </div>
-
-    {% if renderings %}
-    <div class="row g-3" id="renderings-grid">
-      {% for r in renderings %}
-      <div class="col-12 col-md-6 col-lg-4">
-        <div class="card h-100 bg-dark border-0 shadow-sm position-relative">
-          <img class="card-img-top" src="{{ url_for('static', filename='renderings/' ~ r['image_filename']) }}" alt="Rendering">
-          <div class="card-body">
-            <div class="form-check">
-              <input class="form-check-input rendering-check" type="checkbox" value="{{ r['id'] }}" id="chk{{ r['id'] }}">
-              <label class="form-check-label" for="chk{{ r['id'] }}">Select</label>
-            </div>
-            <p class="small text-muted mt-2 mb-1">Created {{ r['created_at'] }}</p>
-            <span class="badge bg-success me-1{% if not r['liked'] %} d-none{% endif %}" id="liked{{ r['id'] }}">Liked</span>
-            <span class="badge bg-warning text-dark{% if not r['favorite'] %} d-none{% endif %}" id="fav{{ r['id'] }}">Favorite</span>
-          </div>
-        </div>
-      </div>
-      {% endfor %}
-    </div>
-    {% else %}
-      <div class="alert alert-secondary">No renderings yet. Use the form above to generate one.</div>
-    {% endif %}
-  </div>
-</div>
-
-<!-- Email Modal -->
-<div class="modal fade" id="emailModal" tabindex="-1">
-  <div class="modal-dialog">
-    <div class="modal-content bg-dark-subtle">
-      <form method="post" action="{{ url_for('bulk_action', project_id=project['id'], room_key=room_key) }}">
-        <div class="modal-header">
-          <h5 class="modal-title">Email Selected Renderings</h5>
-          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-        </div>
-        <div class="modal-body">
-          <input type="hidden" name="selected_ids" id="selected_ids_modal">
-          <div class="mb-3">
-            <label class="form-label">Recipient Email</label>
-            <input type="email" class="form-control" name="recipient" required>
-            <div class="form-text">Only <em>Liked</em> renderings are eligible for email.</div>
-          </div>
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-          <button name="action" value="email" class="btn btn-primary" type="submit">Send</button>
-        </div>
-      </form>
-    </div>
-  </div>
-</div>
-
-<script>
-  // Gather selected IDs into hidden inputs before submitting bulk forms
-  const updateSelected = () => {
-    const ids = Array.from(document.querySelectorAll('.rendering-check:checked')).map(c => c.value);
-    document.getElementById('selected_ids_input').value = ids.join(',');
-    const modalField = document.getElementById('selected_ids_modal');
-    if (modalField) modalField.value = ids.join(',');
-  };
-  document.addEventListener('change', (e) => {
-    if (e.target.classList.contains('rendering-check')) updateSelected();
-  });
-  document.addEventListener('DOMContentLoaded', updateSelected);
-</script>
-{% endblock %}
-"""
-    (TEMPLATE_DIR / 'room.html').write_text(room_html, encoding='utf-8')
-
-    # --- slideshow.html ---
-    slideshow_html = r"""{% extends 'base.html' %}
-{% block content %}
-<h3>Slideshow — Favorites ({{ images|length }})</h3>
-<div id="slideshow" class="position-relative" style="max-width: 1000px; margin:auto;">
-  {% for img in images %}
-  <img src="{{ url_for('static', filename='renderings/' ~ img) }}" class="slide-item w-100 rounded-3 shadow mb-3" style="display: none;">
-  {% endfor %}
-</div>
-<div class="text-center mt-3">
-  <button class="btn btn-light me-2" onclick="prevSlide()">Prev</button>
-  <button class="btn btn-primary" onclick="nextSlide()">Next</button>
-</div>
-<script>
-  let current = 0;
-  const slides = document.querySelectorAll('.slide-item');
-  function show(n){
-    if (!slides.length) return;
-    slides.forEach((s,i)=> s.style.display = (i===n? 'block':'none'));
-  }
-  function nextSlide(){ current = (current + 1) % slides.length; show(current); }
-  function prevSlide(){ current = (current - 1 + slides.length) % slides.length; show(current); }
-  document.addEventListener('DOMContentLoaded', ()=> show(0));
-</script>
-{% endblock %}
-"""
-    (TEMPLATE_DIR / 'slideshow.html').write_text(slideshow_html, encoding='utf-8')
-
-    # --- static/css/app.css ---
-    css = r"""
-body { background: #0b0f17; }
-.card { border-radius: 1rem; }
-.card-img-top { border-top-left-radius: 1rem; border-top-right-radius: 1rem; }
-"""
-    (STATIC_DIR / 'css' / 'app.css').write_text(css, encoding='utf-8')
-
-    # --- static/js/app.js ---
-    js = r"""
-// Placeholder for future enhancements
-"""
-    (STATIC_DIR / 'js' / 'app.js').write_text(js, encoding='utf-8')
-
-# ------------------------------------------------------------
-# Database helpers
-# ------------------------------------------------------------
 
 def get_db():
     conn = sqlite3.connect(DB_PATH)
@@ -524,562 +80,798 @@ def get_db():
     return conn
 
 
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
+# -----------------------------
+# Auth Utilities
+# -----------------------------
+
+def login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            flash("Please sign in to continue.", "warning")
+            return redirect(url_for("login", next=request.path))
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def current_user():
+    uid = session.get("user_id")
+    if not uid:
+        return None
+    with closing(get_db()) as db:
+        cur = db.execute("SELECT * FROM users WHERE id = ?", (uid,))
+        return cur.fetchone()
+
+
+# -----------------------------
+# OpenAI Image Generation
+# -----------------------------
+
+def generate_image_b64(prompt: str, size: str = "1024x1024") -> bytes:
+    """Generate an image with OpenAI Images API, return raw bytes.
+    Requires OPENAI_API_KEY env var and openai SDK installed.
+    """
+    if openai_client is None:
+        raise RuntimeError("OpenAI SDK not installed. Add 'openai' to requirements.txt")
+
+    # gpt-image-1 returns base64 data
+    resp = openai_client.images.generate(
+        model="gpt-image-1",
+        prompt=prompt,
+        size=size
     )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS projects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            title TEXT NOT NULL,
-            description TEXT,
-            plan_filename TEXT,
-            has_basement INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS renderings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project_id INTEGER NOT NULL,
-            user_id INTEGER,
-            room_key TEXT NOT NULL,
-            title TEXT,
-            options_json TEXT,
-            image_filename TEXT NOT NULL,
-            liked INTEGER DEFAULT 0,
-            favorite INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(project_id) REFERENCES projects(id),
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
-
-# ------------------------------------------------------------
-# Auth helpers
-# ------------------------------------------------------------
-
-def current_user_id():
-    return session.get('user_id')
+    b64 = resp.data[0].b64_json
+    return base64.b64decode(b64)
 
 
-def login_required():
-    if not current_user_id():
-        flash('Please log in to access that page.', 'error')
-        return redirect(url_for('login'))
-    return None
+def save_image(image_bytes: bytes, filename_prefix: str = "render") -> str:
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S%f")
+    filename = f"{filename_prefix}_{ts}.png"
+    path = os.path.join(IMAGES_DIR, filename)
+    with open(path, "wb") as f:
+        f.write(image_bytes)
+    # Return relative path for serving
+    return os.path.join("static", "images", filename)
 
-# ------------------------------------------------------------
-# Domain: Rooms & Options
-# ------------------------------------------------------------
 
-ROOM_DEFS: Dict[str, Dict] = {
-    'front_exterior': {
-        'title': 'Front Exterior',
-        'options': [
-            {'name':'style','label':'Style','placeholder':'Modern farmhouse'},
-            {'name':'siding','label':'Siding','placeholder':'Board & batten'},
-            {'name':'roof','label':'Roof','placeholder':'Metal standing seam'},
-        ]
+# -----------------------------
+# Room / Option Catalogs (5 types each where applicable)
+# -----------------------------
+ROOM_CATEGORIES = [
+    "Living Room", "Kitchen", "Home Office",
+    "Primary Bedroom", "Primary Bathroom",
+    "Bedroom2", "Bedroom3", "Family Room",
+]
+
+BASEMENT_EXTRA_ROOMS = {
+    "Basement w/ Bar": {},
+    "Theater Room": {},
+    "Exercise Room": {},
+    "Steam Room": {},
+    "Game Room": {},
+    "Gym": {},
+    "Basement Hallway": {},
+}
+
+OPTIONS = {
+    "Front Exterior": {
+        "Siding Material": ["Brick", "Stone", "Stucco", "Wood", "Fiber Cement"],
+        "Roof Style": ["Gable", "Hip", "Flat", "Mansard", "Shed"],
+        "Window Trim Color": ["Black", "White", "Bronze", "Gray", "Natural Wood"],
+        "Landscaping": ["Modern", "Lush", "Xeriscape", "Minimalist", "Cottage"],
+        "Vehicle": ["SUV", "Sedan", "Truck", "EV", "No Vehicle"],
+        "Driveway Material": ["Concrete", "Pavers", "Asphalt", "Gravel", "Stamped Concrete"],
+        "Driveway Shape": ["Straight", "Curved", "Circular", "Side Entry", "Split"],
+        "Gate Style": ["Modern", "Wrought Iron", "Wood", "No Gate", "Hedge"],
+        "Garage Style": ["Two-Car", "Three-Car", "Carriage", "Glass Panel", "Side Entry"],
     },
-    'back_exterior': {
-        'title': 'Back Exterior',
-        'options': [
-            {'name':'patio','label':'Patio/Deck','placeholder':'Covered patio with pergola'},
-            {'name':'pool','label':'Pool','placeholder':'Infinity pool'},
-            {'name':'landscape','label':'Landscape','placeholder':'Evergreen shrubs'},
-        ]
+    "Back Exterior": {
+        "Siding Material": ["Brick", "Stone", "Stucco", "Wood", "Fiber Cement"],
+        "Roof Style": ["Gable", "Hip", "Flat", "Mansard", "Shed"],
+        "Window Trim Color": ["Black", "White", "Bronze", "Gray", "Natural Wood"],
+        "Landscaping": ["Modern", "Lush", "Xeriscape", "Minimalist", "Cottage"],
+        "Swimming Pool": ["Rectangular", "Freeform", "Lap", "Infinity", "No Pool"],
+        "Paradise Grills": ["Straight Island", "L-Shaped", "U-Shaped", "Pergola", "None"],
+        "Basketball Court": ["Half Court", "Key Only", "Portable Hoop", "Full Court", "None"],
+        "Water Fountain": ["Tiered", "Modern Bowl", "Wall", "Pond", "None"],
+        "Putting Green": ["Small", "Medium", "Large", "Undulating", "None"],
     },
-    'living_room': {
-        'title': 'Living Room',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Wide-plank oak'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Warm white'},
-            {'name':'lighting','label':'Lighting','placeholder':'Recessed + chandelier'},
-            {'name':'furniture_style','label':'Furniture Style','placeholder':'Modern minimal'},
-            {'name':'chairs','label':'Chairs','placeholder':'Two accent chairs'},
-            {'name':'coffee_table','label':'Coffee Table','placeholder':'Marble top'},
-            {'name':'wine_storage','label':'Wine Storage','placeholder':'Built-in shelves'},
-            {'name':'fireplace','label':'Fireplace','placeholder':'Linear gas fireplace'},
-            {'name':'door_style','label':'Door Style','placeholder':'Steel-framed glass'}
-        ]
+    "Living Room": {
+        "Flooring": ["Hardwood", "Polished Concrete", "Large Tile", "Carpet", "Luxury Vinyl"],
+        "Wall Color": ["Warm White", "Greige", "Soft Gray", "Navy Accent", "Sage"],
+        "Lighting": ["Recessed", "Linear Pendant", "Chandeliers", "Floor Lamps", "Wall Sconces"],
+        "Furniture Style": ["Modern", "Transitional", "Mid-Century", "Traditional", "Scandinavian"],
+        "Chairs": ["Lounge", "Accent", "Club", "Wingback", "Recliner"],
+        "Coffee Tables": ["Glass", "Wood", "Marble", "Nesting", "Lift-Top"],
+        "Wine Storage": ["Built-In Wall", "Credenza", "Under-Stairs", "Display Rack", "Hidden"],
+        "Fireplace": ["Yes", "No"],
+        "Door Style": ["French", "Pocket", "Barn", "Sliding", "Standard"],
     },
-    'kitchen': {
-        'title': 'Kitchen',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Porcelain tile'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Soft gray'},
-            {'name':'lighting','label':'Lighting','placeholder':'Pendants + recessed'},
-            {'name':'cabinet_style','label':'Cabinet Style','placeholder':'Shaker with crown'},
-            {'name':'countertop','label':'Countertop Material','placeholder':'Quartz - Calacatta'},
-            {'name':'appliances','label':'Appliances','placeholder':'Panel-ready set'},
-            {'name':'backsplash','label':'Backsplash','placeholder':'Herringbone marble'},
-            {'name':'sink','label':'Kitchen Sink','placeholder':'Farmhouse apron'},
-            {'name':'island_lights','label':'Lights above the Island','placeholder':'3 brass pendants'}
-        ]
+    "Kitchen": {
+        "Flooring": ["Hardwood", "Tile", "Polished Concrete", "Cork", "Luxury Vinyl"],
+        "Wall Color": ["Warm White", "Cool White", "Pale Gray", "Soft Green", "Clay"],
+        "Lighting": ["Recessed", "Island Pendants", "Under-Cabinet", "Track", "Chandelier"],
+        "Cabinet Style": ["Shaker", "Flat Panel", "Inset", "Beadboard", "Glass Front"],
+        "Countertops": ["Quartz", "Marble", "Granite", "Butcher Block", "Concrete"],
+        "Appliances": ["Stainless", "Panel-Ready", "Black Steel", "Mixed Metals", "Retro"],
+        "Backsplash": ["Subway Tile", "Slab", "Herringbone", "Mosaic", "Zellige"],
+        "Sink": ["Farmhouse", "Undermount", "Integrated", "Trough", "Double Bowl"],
+        "Island Lights": ["3 Pendants", "Single Linear", "Flush Mounts", "Track", "Chandelier"],
     },
-    'home_office': {
-        'title': 'Home Office',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Walnut'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Deep navy'},
-            {'name':'lighting','label':'Lighting','placeholder':'Task + sconces'},
-            {'name':'desk_style','label':'Desk Style','placeholder':'Standing desk'},
-            {'name':'office_chair','label':'Office Chair','placeholder':'Ergonomic leather'},
-            {'name':'storage','label':'Storage','placeholder':'Built-ins with glass'}
-        ]
+    "Home Office": {
+        "Flooring": ["Hardwood", "Carpet", "Cork", "Luxury Vinyl", "Tile"],
+        "Wall Color": ["Muted Blue", "Deep Green", "Gray", "Warm White", "Taupe"],
+        "Lighting": ["Task Lamps", "Recessed", "Pendant", "Wall Washers", "Track"],
+        "Desk Style": ["Standing", "Executive", "Wall-Mounted", "L-Shaped", "Minimalist"],
+        "Office Chair": ["Ergonomic Mesh", "Executive Leather", "Task Chair", "Kneeling", "Stool"],
+        "Storage": ["Built-ins", "Shelving", "Credenza", "Cabinets", "Closet"],
     },
-    'primary_bedroom': {
-        'title': 'Primary Bedroom',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Carpet - plush'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Greige'},
-            {'name':'lighting','label':'Lighting','placeholder':'Cove + reading lights'},
-            {'name':'bed_style','label':'Bed Style','placeholder':'Upholstered king'},
-            {'name':'furniture_style','label':'Furniture Style','placeholder':'Modern walnut'},
-            {'name':'closet','label':'Closet Design','placeholder':'His & Hers built-ins'},
-            {'name':'ceiling_fan','label':'Ceiling Fan','placeholder':'52\" matte black'}
-        ]
+    "Primary Bedroom": {
+        "Flooring": ["Carpet", "Hardwood", "Luxury Vinyl", "Cork", "Bamboo"],
+        "Wall Color": ["Warm White", "Muted Blue", "Dusty Rose", "Sage", "Charcoal"],
+        "Lighting": ["Chandelier", "Sconces", "Recessed", "Lamps", "Cove"],
+        "Bed Style": ["Upholstered", "Wood Platform", "Canopy", "Sleigh", "Storage"],
+        "Furniture Style": ["Modern", "Transitional", "Traditional", "Minimal", "Rustic"],
+        "Closet Design": ["Walk-In", "Reach-In", "Open System", "Island", "Wardrobe"],
+        "Ceiling Fan": ["Yes", "No", "With Light", "Large", "Low-Profile"],
     },
-    'primary_bathroom': {
-        'title': 'Primary Bathroom',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Heated tile'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'White'},
-            {'name':'lighting','label':'Lighting','placeholder':'Sconces + recessed'},
-            {'name':'vanity','label':'Vanity Style','placeholder':'Floating double vanity'},
-            {'name':'shower_or_tub','label':'Shower or Tub','placeholder':'Wet room'},
-            {'name':'tile_style','label':'Tile Style','placeholder':'Zellige'},
-            {'name':'sink','label':'Bathroom Sink','placeholder':'Vessel sinks'},
-            {'name':'mirror','label':'Mirror Style','placeholder':'Arched framed'},
-            {'name':'balcony','label':'Balcony (If on 2nd Floor)','placeholder':'Juliet balcony'}
-        ]
+    "Primary Bathroom": {
+        "Flooring": ["Large Tile", "Marble", "Porcelain", "Natural Stone", "Heated"],
+        "Wall Color": ["Warm White", "Pale Gray", "Greige", "Muted Green", "Taupe"],
+        "Lighting": ["Sconces", "Recessed", "Cove", "Pendant", "Mirror Lights"],
+        "Vanity Style": ["Floating", "Furniture-Style", "Double", "Open Shelf", "Integrated"],
+        "Shower/Tub": ["Large Shower", "Freestanding Tub", "Shower + Tub", "Steam Shower", "Wet Room"],
+        "Tile Style": ["Subway", "Large-Format", "Herringbone", "Mosaic", "Terrazzo"],
+        "Sink": ["Vessel", "Undermount", "Integrated", "Double", "Console"],
+        "Mirror Style": ["Round", "Rectangular", "Backlit", "Arched", "Framed"],
+        "Balcony": ["Yes", "No"],
     },
-    'bedroom2': {
-        'title': 'Bedroom 2',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Carpet'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Pastel blue'},
-            {'name':'lighting','label':'Lighting','placeholder':'Pendant'},
-            {'name':'bed_style','label':'Bed Style','placeholder':'Twin bunk'},
-            {'name':'furniture_style','label':'Furniture Style','placeholder':'Scandi oak'},
-            {'name':'ceiling_fan','label':'Ceiling Fan','placeholder':'Yes'},
-            {'name':'balcony','label':'Balcony (If on 2nd Floor)','placeholder':'No'}
-        ]
+    "Other Bedrooms": {
+        "Flooring": ["Carpet", "Hardwood", "Luxury Vinyl", "Cork", "Bamboo"],
+        "Wall Color": ["Warm White", "Muted Blue", "Soft Gray", "Sage", "Clay"],
+        "Lighting": ["Chandelier", "Sconces", "Recessed", "Lamps", "Pendant"],
+        "Bed Style": ["Upholstered", "Wood Platform", "Bunk", "Daybed", "Storage"],
+        "Furniture Style": ["Modern", "Transitional", "Traditional", "Minimal", "Rustic"],
+        "Ceiling Fan": ["Yes", "No", "With Light", "Large", "Low-Profile"],
+        "Balcony": ["Yes", "No"],
     },
-    'bedroom3': {
-        'title': 'Bedroom 3',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Carpet'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Sage'},
-            {'name':'lighting','label':'Lighting','placeholder':'Flush mount'},
-            {'name':'bed_style','label':'Bed Style','placeholder':'Queen platform'},
-            {'name':'furniture_style','label':'Furniture Style','placeholder':'Mid-century'},
-            {'name':'ceiling_fan','label':'Ceiling Fan','placeholder':'Yes'},
-            {'name':'balcony','label':'Balcony (If on 2nd Floor)','placeholder':'No'}
-        ]
+    "Half Bath": {
+        "Flooring": ["Tile", "Marble", "Concrete", "Luxury Vinyl", "Stone"],
+        "Wall Color": ["Warm White", "Deep Blue", "Sage", "Blush", "Charcoal"],
+        "Lighting": ["Sconces", "Pendant", "Recessed", "Strip", "Mirror Lights"],
+        "Vanity Style": ["Floating", "Pedestal", "Console", "Furniture", "Integrated"],
+        "Tile Style": ["Subway", "Mosaic", "Large-Format", "Herringbone", "Zellige"],
+        "Mirror Style": ["Round", "Rectangular", "Backlit", "Arched", "Framed"],
     },
-    'family_room': {
-        'title': 'Family Room',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Engineered wood'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Cream'},
-            {'name':'lighting','label':'Lighting','placeholder':'Recessed'},
-            {'name':'seating','label':'Seating','placeholder':'Sectional sofa'},
-            {'name':'media','label':'Media','placeholder':'Built-in TV wall'}
-        ]
+    "Game Room": {
+        "Flooring": ["Carpet Tile", "Rubber", "Luxury Vinyl", "Laminate", "Epoxy"],
+        "Wall Color": ["Charcoal", "Navy", "Red", "Gray", "White"],
+        "Lighting": ["LED Strips", "Pendant", "Track", "Recessed", "Neon"],
+        "Pool Table": ["Black", "Oak", "Walnut", "White", "Industrial"],
+        "Wine Bar": ["Backlit", "Stone", "Wood", "Glass", "Concrete"],
+        "Arcade Games": ["Racing", "Fighting", "Pinball", "Shooter", "Retro"],
+        "Other Table Games": ["Air Hockey", "Foosball", "Table Tennis", "Shuffleboard", "Cards"],
     },
-    'half_bath': {
-        'title': 'Half Bath / Powder Room',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Patterned tile'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Bold wallpaper'},
-            {'name':'lighting','label':'Lighting','placeholder':'Sconce pair'},
-            {'name':'vanity','label':'Vanity Style','placeholder':'Pedestal'},
-            {'name':'tile_style','label':'Tile Style','placeholder':'Mosaic'},
-            {'name':'mirror','label':'Mirror Style','placeholder':'Round brass'}
-        ]
+    "Gym": {
+        "Flooring": ["Rubber", "Foam", "Cork", "Vinyl", "Carpet Tile"],
+        "Wall Color": ["White", "Gray", "Blue", "Black", "Green"],
+        "Lighting": ["Bright LED", "Track", "Recessed", "Wall Washers", "Mirror Lights"],
+        "Equipment": ["Racks", "Cardio", "Free Weights", "Cable Machine", "Kettlebells"],
+        "Gym Station": ["Power Rack", "Smith Machine", "Functional Trainer", "Pilates", "Rowing"],
+        "Steam Room": ["Yes", "No"],
     },
-    # Basement-related
-    'basement_game_room': {
-        'title': 'Basement — Game Room (Bar)',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'LVP'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Charcoal'},
-            {'name':'lighting','label':'Lighting','placeholder':'Track lights'},
-            {'name':'pool_table','label':'Pool Table','placeholder':'Yes'},
-            {'name':'wine_bar','label':'Wine Bar','placeholder':'Backlit shelves'},
-            {'name':'arcade_games','label':'Types of Arcade Games','placeholder':'Pinball, retro cabinet'},
-            {'name':'table_games','label':'Other Table Games','placeholder':'Foosball, air hockey'}
-        ]
+    "Theater Room": {
+        "Flooring": ["Carpet", "Acoustic Wood", "Luxury Vinyl", "Cork", "Risers"],
+        "Wall Color": ["Black", "Deep Navy", "Burgundy", "Charcoal", "Chocolate"],
+        "Lighting": ["Sconces", "LED Strips", "Step Lights", "Recessed", "Fiber Optic Ceiling"],
+        "Wall Treatment": ["Acoustic Panels", "Fabric", "Wood Slats", "Foam", "Wallpaper"],
+        "Seating": ["Recliners", "Sofas", "Loveseats", "Chaise", "Stadium"],
+        "Popcorn Machine": ["Yes", "No"],
+        "Sound System": ["5.1", "7.1", "Atmos", "Soundbar", "Hidden"],
+        "Screen Type": ["Projector", "OLED", "MicroLED", "Ultra Short Throw", "Acoustic Screen"],
+        "Movie Posters": ["Yes", "No"],
+        "Show Movie": ["Yes", "No"],
     },
-    'basement_gym': {
-        'title': 'Basement — Gym',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Rubber tiles'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'White'},
-            {'name':'lighting','label':'Lighting','placeholder':'Bright LEDs'},
-            {'name':'equipment','label':'Types of Equipment','placeholder':'Treadmill, rack, bike'},
-            {'name':'gym_station','label':'Gym Station','placeholder':'Cable crossover'},
-            {'name':'steam_room','label':'Steam Room','placeholder':'Yes'}
-        ]
-    },
-    'basement_theater': {
-        'title': 'Basement — Theater Room',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'Dark carpet'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Blackout paint'},
-            {'name':'lighting','label':'Lighting','placeholder':'LED strips'},
-            {'name':'wall_treatment','label':'Wall Treatment','placeholder':'Acoustic panels'},
-            {'name':'seating','label':'Seating','placeholder':'Recliners, 2 rows'},
-            {'name':'popcorn','label':'Popcorn Machine','placeholder':'Vintage style'},
-            {'name':'sound_system','label':'Sound System','placeholder':'Dolby Atmos'},
-            {'name':'screen_type','label':'Screen Type','placeholder':'Projector 120\"'},
-            {'name':'movie_posters','label':'Movie Posters on Walls','placeholder':'Classic films'},
-            {'name':'show_movie','label':'Show Movie on Screen','placeholder':'Yes'}
-        ]
-    },
-    'basement_hallway': {
-        'title': 'Basement — Hallway',
-        'options': [
-            {'name':'flooring','label':'Flooring','placeholder':'LVP'},
-            {'name':'wall_color','label':'Wall Color','placeholder':'Light gray'},
-            {'name':'lighting','label':'Lighting','placeholder':'Sconces'}
-        ]
+    "Basement Hallway": {
+        "Flooring": ["Tile", "Carpet", "Luxury Vinyl", "Concrete", "Wood"],
+        "Wall Color": ["White", "Gray", "Taupe", "Blue", "Green"],
+        "Lighting": ["Sconces", "Recessed", "Cove", "Track", "Wall Washers"],
+        "Stairs": ["Open Riser", "Carpeted", "Wood", "Glass Rail", "Metal"],
     },
 }
 
-# ------------------------------------------------------------
-# Placeholder image generator (replace with real AI integration)
-# ------------------------------------------------------------
 
-def create_placeholder_image(text_lines: List[str], dest_path: Path, size=(1200, 800)) -> None:
-    img = Image.new('RGB', size, color=(20, 25, 35))
-    draw = ImageDraw.Draw(img)
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 30)
-        big = ImageFont.truetype("DejaVuSans-Bold.ttf", 48)
-    except Exception:
-        font = ImageFont.load_default()
-        big = ImageFont.load_default()
-    y = 40
-    draw.text((40, y), "Architect 3D Home Modeler", fill=(200, 220, 255), font=big)
-    y += 80
-    for line in text_lines:
-        draw.text((40, y), line, fill=(230, 230, 230), font=font)
-        y += 40
-    img.save(dest_path)
+# -----------------------------
+# Templates (inline for single-file deploy)
+# -----------------------------
+BASE_HTML = r"""
+<!doctype html>
+<html lang="en" class="h-full" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title or app_name }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      function toggleTheme(){
+        const html = document.documentElement;
+        const current = html.getAttribute('data-theme') || 'light';
+        const next = current === 'light' ? 'dark' : 'light';
+        html.setAttribute('data-theme', next);
+        localStorage.setItem('theme', next);
+        document.body.classList.toggle('bg-gray-950');
+        document.body.classList.toggle('text-gray-100');
+      }
+      document.addEventListener('DOMContentLoaded',()=>{
+        const saved = localStorage.getItem('theme');
+        if(saved==='dark'){ toggleTheme(); }
+      });
+      // Voice input using Web Speech API
+      function startVoice(targetId){
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if(!SpeechRecognition){ alert('Voice input not supported in this browser.'); return; }
+        const recog = new SpeechRecognition();
+        recog.lang = 'en-US';
+        recog.onresult = (e)=>{
+          const text = e.results[0][0].transcript;
+          const el = document.getElementById(targetId);
+          el.value = (el.value? el.value+' ' : '') + text;
+        };
+        recog.start();
+      }
+    </script>
+  </head>
+  <body class="min-h-screen bg-white">
+    <div class="max-w-7xl mx-auto p-4">
+      <header class="flex items-center justify-between py-4">
+        <h1 class="text-2xl font-bold">{{ app_name }}</h1>
+        <div class="flex items-center gap-2">
+          <button onclick="toggleTheme()" class="px-3 py-1 rounded-xl border">Toggle Dark Mode</button>
+          {% if user %}
+            <span class="text-sm">{{ user['email'] }}</span>
+            <a href="{{ url_for('logout') }}" class="px-3 py-1 rounded-xl border">Logout</a>
+          {% else %}
+            <a href="{{ url_for('login') }}" class="px-3 py-1 rounded-xl border">Login</a>
+            <a href="{{ url_for('register') }}" class="px-3 py-1 rounded-xl border">Register</a>
+          {% endif %}
+        </div>
+      </header>
+      {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+          <div class="space-y-2">
+            {% for cat,msg in messages %}
+              <div class="p-3 rounded-xl border {{ 'bg-green-50' if cat=='success' else 'bg-yellow-50' }}">{{ msg }}</div>
+            {% endfor %}
+          </div>
+        {% endif %}
+      {% endwith %}
+      {% block content %}{% endblock %}
+    </div>
+  </body>
+</html>
+"""
 
-# ------------------------------------------------------------
+INDEX_HTML = r"""
+{% extends 'base.html' %}
+{% block content %}
+  <section class="grid md:grid-cols-2 gap-6">
+    <form action="{{ url_for('generate') }}" method="post" enctype="multipart/form-data" class="p-4 rounded-2xl border">
+      <h2 class="text-xl font-semibold mb-2">Describe Your Dream Home</h2>
+      <textarea id="home_desc" name="home_desc" rows="5" class="w-full border rounded-xl p-3" placeholder="e.g., Modern 2-story with 4 bedrooms, walkout basement, theater room, and a backyard pool."></textarea>
+      <div class="mt-2">
+        <button type="button" onclick="startVoice('home_desc')" class="px-3 py-1 rounded-xl border">🎤 Voice Prompt</button>
+      </div>
+      <div class="my-4">
+        <label class="block font-medium">Upload Architectural Plan (optional)</label>
+        <input type="file" name="plan_file" accept="image/*,.pdf" class="mt-1" />
+      </div>
+      <div class="flex items-center gap-3">
+        <button class="px-4 py-2 rounded-2xl bg-black text-white">Generate House Plan</button>
+        <a href="{{ url_for('gallery') }}" class="px-4 py-2 rounded-2xl border">Go to Gallery</a>
+      </div>
+      <p class="text-xs text-gray-500 mt-2">Pressing Generate will create 2 exterior renderings (Front & Back). You can refine interiors via room categories below.</p>
+    </form>
+
+    <div class="p-4 rounded-2xl border">
+      <h2 class="text-xl font-semibold mb-2">Room Categories</h2>
+      <form id="room-form" action="{{ url_for('generate_room') }}" method="post" class="space-y-3">
+        <label class="block">Select Room
+          <select class="w-full border rounded-xl p-2" name="room" id="room-select">
+            <option value="Front Exterior">Front Exterior</option>
+            <option value="Back Exterior">Back Exterior</option>
+            {% for r in base_rooms %}
+              <option value="{{ r }}">{{ r }}</option>
+            {% endfor %}
+            {% if 'basement' in (pre_desc or '').lower() %}
+              <option disabled>──────── Basement ────────</option>
+              <option value="Game Room">Game Room</option>
+              <option value="Gym">Gym</option>
+              <option value="Theater Room">Theater Room</option>
+              <option value="Basement Hallway">Basement Hallway</option>
+            {% endif %}
+          </select>
+        </label>
+        <div id="room-options" class="space-y-2"></div>
+        <input type="hidden" name="home_desc" value="{{ pre_desc or '' }}" />
+        <button class="px-4 py-2 rounded-2xl bg-black text-white">Generate Room Rendering</button>
+      </form>
+    </div>
+  </section>
+
+  <script>
+    const ALL_OPTIONS = {{ options_json | safe }};
+    const roomSelect = document.getElementById('room-select');
+    const optionsContainer = document.getElementById('room-options');
+
+    function renderOptions(room){
+      optionsContainer.innerHTML = '';
+      const opts = ALL_OPTIONS[room];
+      if(!opts){ return; }
+      Object.entries(opts).forEach(([label, arr])=>{
+        const wrap = document.createElement('label');
+        wrap.className = 'block';
+        const sel = document.createElement('select');
+        sel.name = label;
+        sel.className = 'w-full border rounded-xl p-2';
+        (arr || []).forEach(v=>{
+          const o = document.createElement('option');
+          o.value = v; o.textContent = v; sel.appendChild(o);
+        });
+        wrap.innerHTML = `<span class='font-medium'>${label}</span>`;
+        wrap.appendChild(sel);
+        optionsContainer.appendChild(wrap);
+      });
+    }
+
+    renderOptions(roomSelect.value);
+    roomSelect.addEventListener('change', e=> renderOptions(e.target.value));
+  </script>
+{% endblock %}
+"""
+
+GALLERY_HTML = r"""
+{% extends 'base.html' %}
+{% block content %}
+  <div class="flex items-center justify-between mb-3">
+    <h2 class="text-xl font-semibold">Your Renderings</h2>
+    <div class="flex items-center gap-2">
+      <form id="bulk-actions" method="post" action="{{ url_for('bulk_action') }}" class="flex items-center gap-2">
+        <input type="hidden" name="ids" id="bulk-ids" />
+        <select name="action" class="border rounded-xl p-2">
+          <option value="like">Like</option>
+          <option value="favorite">Favorite</option>
+          <option value="delete">Delete</option>
+          <option value="download">Download</option>
+          <option value="email">Email</option>
+        </select>
+        <input type="email" name="email_to" class="border rounded-xl p-2" placeholder="email (for emailing)" />
+        <button class="px-3 py-2 rounded-2xl bg-black text-white">Apply</button>
+      </form>
+      {% if favorite_count >= 2 %}
+        <a href="{{ url_for('slideshow') }}" class="px-3 py-2 rounded-2xl border">▶ Slideshow</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <form id="select-form" class="grid md:grid-cols-3 gap-4">
+    {% for r in items %}
+      <div class="border rounded-2xl overflow-hidden group">
+        <div class="relative">
+          <img src="/{{ r['image_path'] }}" alt="{{ r['title'] or r['category'] }}" class="w-full aspect-square object-cover" />
+          <button type="button" onclick="toggleCardDark(this)" class="absolute top-2 right-2 px-2 py-1 text-xs bg-white/80 rounded">Dark Mode</button>
+        </div>
+        <div class="p-3 space-y-1">
+          <label class="flex items-center gap-2">
+            <input type="checkbox" value="{{ r['id'] }}" class="select-box" />
+            <span class="text-sm text-gray-600">Select</span>
+          </label>
+          <div class="text-sm font-medium">{{ r['title'] or r['category'] }}</div>
+          <div class="text-xs text-gray-500">{{ r['created_at'] }}</div>
+          <div class="flex items-center gap-2 text-xs">
+            <span class="px-2 py-1 rounded-full border {{ 'bg-green-100' if r['liked'] else '' }}">❤ Like</span>
+            <span class="px-2 py-1 rounded-full border {{ 'bg-yellow-100' if r['favorited'] else '' }}">★ Favorite</span>
+          </div>
+        </div>
+      </div>
+    {% else %}
+      <p class="text-gray-500">No renderings yet. Go to the home page and generate your first design!</p>
+    {% endfor %}
+  </form>
+
+  <script>
+    function toggleCardDark(btn){
+      const card = btn.closest('.border');
+      card.classList.toggle('invert');
+      card.classList.toggle('bg-black');
+    }
+    const selectBoxes = document.querySelectorAll('.select-box');
+    const bulkIds = document.getElementById('bulk-ids');
+    const bulkForm = document.getElementById('bulk-actions');
+    function updateIds(){
+      const ids = Array.from(selectBoxes).filter(cb=>cb.checked).map(cb=>cb.value);
+      bulkIds.value = ids.join(',');
+    }
+    selectBoxes.forEach(cb=> cb.addEventListener('change', updateIds));
+    bulkForm.addEventListener('submit', (e)=>{
+      updateIds();
+      if(!bulkIds.value){ e.preventDefault(); alert('Select at least one rendering.'); }
+    });
+  </script>
+{% endblock %}
+"""
+
+SLIDESHOW_HTML = r"""
+{% extends 'base.html' %}
+{% block content %}
+  <h2 class="text-xl font-semibold mb-3">Favorites Slideshow</h2>
+  <div id="slides" class="relative w-full max-w-4xl mx-auto">
+    {% for r in items %}
+      <img src="/{{ r['image_path'] }}" class="w-full rounded-2xl hidden" />
+    {% endfor %}
+  </div>
+  <div class="flex items-center justify-center gap-2 mt-3">
+    <button id="prev" class="px-3 py-2 rounded-2xl border">Prev</button>
+    <button id="next" class="px-3 py-2 rounded-2xl border">Next</button>
+    <button id="play" class="px-3 py-2 rounded-2xl border">Play</button>
+  </div>
+  <script>
+    const slides = Array.from(document.querySelectorAll('#slides img'));
+    let idx = 0; let timer = null;
+    function show(i){ slides.forEach((img,j)=> img.classList.toggle('hidden', j!==i)); }
+    function next(){ idx = (idx+1)%slides.length; show(idx); }
+    function prev(){ idx = (idx-1+slides.length)%slides.length; show(idx); }
+    document.getElementById('next').onclick = next;
+    document.getElementById('prev').onclick = prev;
+    document.getElementById('play').onclick = ()=>{
+      if(timer){ clearInterval(timer); timer=null; return; }
+      timer = setInterval(next, 2500);
+    };
+    if(slides.length){ show(0); }
+  </script>
+{% endblock %}
+"""
+
+AUTH_HTML = r"""
+{% extends 'base.html' %}
+{% block content %}
+  <div class="max-w-md mx-auto p-6 rounded-2xl border">
+    <h2 class="text-xl font-semibold mb-4">{{ heading }}</h2>
+    <form method="post">
+      <label class="block mb-2">
+        <span class="text-sm">Email</span>
+        <input name="email" type="email" required class="w-full border rounded-xl p-2"/>
+      </label>
+      <label class="block mb-4">
+        <span class="text-sm">Password</span>
+        <input name="password" type="password" required class="w-full border rounded-xl p-2"/>
+      </label>
+      <button class="px-4 py-2 rounded-2xl bg-black text-white w-full">{{ cta }}</button>
+    </form>
+  </div>
+{% endblock %}
+"""
+
+# Register templates with Flask's loader API
+app.jinja_loader.mapping = {
+    'base.html': BASE_HTML,
+    'index.html': INDEX_HTML,
+    'gallery.html': GALLERY_HTML,
+    'slideshow.html': SLIDESHOW_HTML,
+    'auth.html': AUTH_HTML,
+}
+
+
+# -----------------------------
 # Routes
-# ------------------------------------------------------------
-
-@app.before_request
-def setup():
-    ensure_dirs_and_templates()
-    init_db()
-
+# -----------------------------
 @app.route('/')
 def index():
-    return render_template('index.html')
+    user = current_user()
+    pre_desc = session.get('last_desc', '')
+    return render_template_string(
+        app.jinja_loader.get_source(app.jinja_env, 'index.html')[0],
+        app_name=APP_NAME,
+        title=APP_NAME,
+        user=user,
+        base_rooms=ROOM_CATEGORIES,
+        pre_desc=pre_desc,
+        options_json=OPTIONS,
+    )
 
+
+@app.post('/generate')
+@login_required
+def generate():
+    desc = request.form.get('home_desc','').strip()
+    session['last_desc'] = desc
+
+    # Check for basement keyword to influence prompts
+    has_basement = 'basement' in desc.lower()
+
+    # Process plan file (optional) - not parsed, just noted
+    plan_file = request.files.get('plan_file')
+    plan_hint = ""
+    if plan_file and plan_file.filename:
+        plan_hint = " Architectural plan provided."
+
+    prompts = [
+        f"Front exterior architectural rendering, {desc}. Photorealistic, golden hour, ultra-detailed.{plan_hint}",
+        f"Back exterior architectural rendering, {desc}. Photorealistic, high detail backyard amenities.{plan_hint}",
+    ]
+
+    created_paths = []
+    for i, p in enumerate(prompts):
+        try:
+            img_bytes = generate_image_b64(p)
+            rel = save_image(img_bytes, filename_prefix=('front' if i==0 else 'back'))
+            created_paths.append((rel, 'Front Exterior' if i==0 else 'Back Exterior'))
+        except Exception as e:
+            app.logger.exception("Image generation failed: %s", e)
+            flash(f"Image generation failed: {e}", "warning")
+
+    # Save records
+    with closing(get_db()) as db:
+        for rel, cat in created_paths:
+            db.execute(
+                "INSERT INTO renderings (user_id, title, category, prompt, image_path, created_at) VALUES (?,?,?,?,?,?)",
+                (session['user_id'], cat, cat.lower().replace(' ', '_'), desc, rel, datetime.utcnow().isoformat())
+            )
+        db.commit()
+
+    if created_paths:
+        flash("Generated exterior renderings!", "success")
+    return redirect(url_for('gallery'))
+
+
+@app.post('/generate-room')
+@login_required
+def generate_room():
+    room = request.form.get('room')
+    desc = request.form.get('home_desc','').strip()
+    # Build prompt from selected options
+    details = []
+    for key in request.form.keys():
+        if key in ("room", "home_desc"):
+            continue
+        val = request.form.get(key)
+        if val:
+            details.append(f"{key}: {val}")
+    details_text = ", ".join(details)
+
+    prompt = f"{room} interior design rendering. {desc}. Style options: {details_text}. Photorealistic, 4k, natural lighting."
+
+    try:
+        img_bytes = generate_image_b64(prompt)
+        rel = save_image(img_bytes, filename_prefix=room.lower().replace(' ', ''))
+        with closing(get_db()) as db:
+            db.execute(
+                "INSERT INTO renderings (user_id, title, category, prompt, image_path, created_at) VALUES (?,?,?,?,?,?)",
+                (session['user_id'], room, room.lower().replace(' ', '_'), prompt, rel, datetime.utcnow().isoformat())
+            )
+            db.commit()
+        flash(f"Generated {room} rendering!", "success")
+    except Exception as e:
+        app.logger.exception("Image generation failed: %s", e)
+        flash(f"Image generation failed: {e}", "warning")
+
+    return redirect(url_for('gallery'))
+
+
+@app.get('/gallery')
+@login_required
+def gallery():
+    with closing(get_db()) as db:
+        cur = db.execute(
+            "SELECT * FROM renderings WHERE user_id = ? ORDER BY created_at DESC",
+            (session['user_id'],)
+        )
+        items = cur.fetchall()
+        cur2 = db.execute(
+            "SELECT COUNT(*) as c FROM renderings WHERE user_id = ? AND favorited = 1",
+            (session['user_id'],)
+        )
+        favorite_count = cur2.fetchone()[0]
+    return render_template_string(
+        app.jinja_loader.get_source(app.jinja_env, 'gallery.html')[0],
+        app_name=APP_NAME, title="Gallery", user=current_user(), items=items, favorite_count=favorite_count
+    )
+
+
+@app.post('/bulk')
+@login_required
+def bulk_action():
+    ids_raw = request.form.get('ids','')
+    action = request.form.get('action','')
+    email_to = request.form.get('email_to','').strip()
+    if not ids_raw:
+        flash("No items selected.", "warning")
+        return redirect(url_for('gallery'))
+    try:
+        ids = [int(x) for x in ids_raw.split(',') if x]
+    except:
+        flash("Invalid selection.", "warning")
+        return redirect(url_for('gallery'))
+
+    with closing(get_db()) as db:
+        if action in ("like", "favorite"):
+            field = 'liked' if action=='like' else 'favorited'
+            placeholders = ','.join('?'*len(ids))
+            db.execute(f"UPDATE renderings SET {field}=1 WHERE user_id=? AND id IN ({placeholders})", (session['user_id'], *ids))
+            db.commit()
+            flash(f"Marked {len(ids)} as {action}d.", "success")
+        elif action == 'delete':
+            placeholders = ','.join('?'*len(ids))
+            cur = db.execute(f"SELECT image_path FROM renderings WHERE user_id=? AND id IN ({placeholders})", (session['user_id'], *ids))
+            paths = [row['image_path'] for row in cur.fetchall()]
+            db.execute(f"DELETE FROM renderings WHERE user_id=? AND id IN ({placeholders})", (session['user_id'], *ids))
+            db.commit()
+            # Try delete files
+            for p in paths:
+                fp = os.path.join(BASE_DIR, p)
+                if os.path.exists(fp):
+                    try: os.remove(fp)
+                    except: pass
+            flash(f"Deleted {len(ids)} renderings.", "success")
+        elif action == 'download':
+            # stream a zip
+            mem = io.BytesIO()
+            with zipfile.ZipFile(mem, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
+                cur = db.execute(
+                    f"SELECT id, image_path, title FROM renderings WHERE user_id=? AND id IN ({','.join('?'*len(ids))})",
+                    (session['user_id'], *ids)
+                )
+                for row in cur.fetchall():
+                    fp = os.path.join(BASE_DIR, row['image_path'])
+                    if os.path.exists(fp):
+                        zf.write(fp, arcname=os.path.basename(fp))
+            mem.seek(0)
+            return send_file(mem, as_attachment=True, download_name='renderings.zip')
+        elif action == 'email':
+            if not email_to:
+                flash("Provide an email address.", "warning")
+                return redirect(url_for('gallery'))
+            try:
+                send_selected_via_email(ids, email_to)
+                flash(f"Emailed {len(ids)} renderings to {email_to}.", "success")
+            except Exception as e:
+                app.logger.exception("Email error: %s", e)
+                flash(f"Email failed: {e}", "warning")
+        else:
+            flash("Unknown action.", "warning")
+    return redirect(url_for('gallery'))
+
+
+@app.get('/slideshow')
+@login_required
+def slideshow():
+    with closing(get_db()) as db:
+        cur = db.execute(
+            "SELECT * FROM renderings WHERE user_id=? AND favorited=1 ORDER BY created_at DESC",
+            (session['user_id'],)
+        )
+        items = cur.fetchall()
+    return render_template_string(
+        app.jinja_loader.get_source(app.jinja_env, 'slideshow.html')[0],
+        app_name=APP_NAME, title="Slideshow", user=current_user(), items=items
+    )
+
+
+# -----------------------------
+# Email Helper
+# -----------------------------
+
+def send_selected_via_email(ids, email_to):
+    import smtplib
+    from email.message import EmailMessage
+
+    with closing(get_db()) as db:
+        cur = db.execute(
+            f"SELECT title, image_path FROM renderings WHERE user_id=? AND id IN ({','.join('?'*len(ids))})",
+            (session['user_id'], *ids)
+        )
+        rows = cur.fetchall()
+
+    msg = EmailMessage()
+    msg['Subject'] = f"{APP_NAME} – Your Selected Renderings"
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = email_to
+    msg.set_content("Attached are your selected renderings.")
+
+    for row in rows:
+        fp = os.path.join(BASE_DIR, row['image_path'])
+        if os.path.exists(fp):
+            with open(fp, 'rb') as f:
+                data = f.read()
+            msg.add_attachment(data, maintype='image', subtype='png', filename=os.path.basename(fp))
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        if SMTP_USER and SMTP_PASS:
+            server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+
+# -----------------------------
+# Auth Routes
+# -----------------------------
 @app.route('/login', methods=['GET','POST'])
 def login():
     if request.method == 'POST':
         email = request.form['email'].strip().lower()
         password = request.form['password']
-        conn = get_db(); cur = conn.cursor()
-        cur.execute('SELECT * FROM users WHERE email=?', (email,))
-        row = cur.fetchone()
-        conn.close()
+        with closing(get_db()) as db:
+            cur = db.execute("SELECT * FROM users WHERE email=?", (email,))
+            row = cur.fetchone()
         if row and check_password_hash(row['password_hash'], password):
             session['user_id'] = row['id']
-            session['username'] = row['username']
-            flash('Welcome back!', 'success')
-            return redirect(url_for('dashboard'))
-        flash('Invalid credentials.', 'error')
-    return render_template('login.html')
+            flash("Welcome back!", "success")
+            next_url = request.args.get('next') or url_for('index')
+            return redirect(next_url)
+        flash("Invalid credentials.", "warning")
+    return render_template_string(
+        app.jinja_loader.get_source(app.jinja_env, 'auth.html')[0],
+        app_name=APP_NAME, title="Login", user=current_user(), heading="Sign In", cta="Sign In"
+    )
+
 
 @app.route('/register', methods=['GET','POST'])
 def register():
     if request.method == 'POST':
-        username = request.form['username'].strip()
         email = request.form['email'].strip().lower()
         password = request.form['password']
-        password_hash = generate_password_hash(password)
-        now = datetime.utcnow().isoformat()
-        conn = get_db(); cur = conn.cursor()
-        try:
-            cur.execute('INSERT INTO users (username,email,password_hash,created_at) VALUES (?,?,?,?)',
-                        (username, email, password_hash, now))
-            conn.commit()
-            flash('Account created. Please log in.', 'success')
-            return redirect(url_for('login'))
-        except sqlite3.IntegrityError:
-            flash('Email already registered.', 'error')
-        finally:
-            conn.close()
-    return render_template('register.html')
+        with closing(get_db()) as db:
+            try:
+                db.execute(
+                    "INSERT INTO users (email, password_hash, created_at) VALUES (?,?,?)",
+                    (email, generate_password_hash(password), datetime.utcnow().isoformat())
+                )
+                db.commit()
+            except sqlite3.IntegrityError:
+                flash("Email already registered.", "warning")
+                return redirect(url_for('register'))
+        flash("Account created. Please sign in.", "success")
+        return redirect(url_for('login'))
+    return render_template_string(
+        app.jinja_loader.get_source(app.jinja_env, 'auth.html')[0],
+        app_name=APP_NAME, title="Register", user=current_user(), heading="Create Account", cta="Create Account"
+    )
 
-@app.route('/logout')
+
+@app.get('/logout')
+@login_required
 def logout():
     session.clear()
-    flash('Logged out.', 'success')
+    flash("Signed out.", "success")
     return redirect(url_for('index'))
 
-@app.route('/dashboard')
-def dashboard():
-    if not current_user_id():
-        return redirect(url_for('login'))
-    uid = current_user_id()
-    conn = get_db(); cur = conn.cursor()
-    cur.execute('SELECT * FROM projects WHERE user_id=? ORDER BY id DESC', (uid,))
-    projects = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return render_template('dashboard.html', projects=projects)
 
-@app.route('/generate', methods=['POST'])
-def generate():
-    description = request.form.get('description','').strip()
-    plan_file = request.files.get('plan_file')
-    plan_filename = None
-    if plan_file and plan_file.filename:
-        safe_name = f"plan_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}_{plan_file.filename.replace(' ','_')}"
-        plan_path = UPLOAD_DIR / safe_name
-        plan_file.save(plan_path)
-        plan_filename = safe_name
+# -----------------------------
+# Health / Init
+# -----------------------------
+@app.get('/healthz')
+def healthz():
+    return {'status':'ok','time': datetime.utcnow().isoformat()}
 
-    has_basement = int('basement' in description.lower())
-    uid = current_user_id()
-    now = datetime.utcnow().isoformat()
 
-    title = f"Home Plan {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
-
-    conn = get_db(); cur = conn.cursor()
-    cur.execute('INSERT INTO projects (user_id,title,description,plan_filename,has_basement,created_at) VALUES (?,?,?,?,?,?)',
-                (uid, title, description, plan_filename, has_basement, now))
-    project_id = cur.lastrowid
-
-    # Create 2 exterior renderings (Front / Back)
-    for key in ['front_exterior','back_exterior']:
-        room = ROOM_DEFS[key]
-        options = {o['name']: '' for o in room['options']}
-        filename = f"proj{project_id}_{key}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.jpg"
-        img_path = RENDER_DIR / filename
-        lines = [room['title'], 'Initial AI render']
-        create_placeholder_image(lines, img_path)
-        cur.execute('''
-            INSERT INTO renderings (project_id,user_id,room_key,title,options_json,image_filename,created_at)
-            VALUES (?,?,?,?,?,?,?)
-        ''', (project_id, uid, key, room['title'], json.dumps(options), filename, now))
-
-    conn.commit(); conn.close()
-    return redirect(url_for('plan', project_id=project_id))
-
-@app.route('/plan/<int:project_id>')
-def plan(project_id):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute('SELECT * FROM projects WHERE id=?', (project_id,))
-    project = cur.fetchone()
-    if not project: conn.close(); abort(404)
-
-    # Build exterior cards using latest rendering image for the key (or placeholder)
-    exteriors = []
-    for key in ['front_exterior','back_exterior']:
-        cur.execute('SELECT * FROM renderings WHERE project_id=? AND room_key=? ORDER BY id DESC LIMIT 1', (project_id, key))
-        r = cur.fetchone()
-        image_filename = r['image_filename'] if r else ''
-        exteriors.append({
-            'title': ROOM_DEFS[key]['title'],
-            'image_filename': image_filename,
-            'room_key': key
-        })
-
-    # Build rooms list
-    base_rooms = ['living_room','kitchen','home_office','primary_bedroom','primary_bathroom','bedroom2','bedroom3','family_room','half_bath']
-    rooms = [{'room_key': k, 'title': ROOM_DEFS[k]['title']} for k in base_rooms]
-    if project['has_basement']:
-        rooms += [
-            {'room_key':'basement_game_room','title':ROOM_DEFS['basement_game_room']['title']},
-            {'room_key':'basement_gym','title':ROOM_DEFS['basement_gym']['title']},
-            {'room_key':'basement_theater','title':ROOM_DEFS['basement_theater']['title']},
-            {'room_key':'basement_hallway','title':ROOM_DEFS['basement_hallway']['title']},
-        ]
-
-    # favorites count
-    cur.execute('SELECT COUNT(*) as c FROM renderings WHERE project_id=? AND favorite=1', (project_id,))
-    favorites_count = cur.fetchone()['c']
-
-    conn.close()
-    return render_template('plan.html', project=dict(project), exteriors=exteriors, rooms=rooms, favorites_count=favorites_count)
-
-@app.route('/plan/<int:project_id>/room/<room_key>')
-def room(project_id, room_key):
-    if room_key not in ROOM_DEFS:
-        abort(404)
-    conn = get_db(); cur = conn.cursor()
-    cur.execute('SELECT * FROM projects WHERE id=?', (project_id,))
-    project = cur.fetchone()
-    if not project: conn.close(); abort(404)
-    cur.execute('SELECT * FROM renderings WHERE project_id=? AND room_key=? ORDER BY id DESC', (project_id, room_key))
-    renderings = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    opt_fields = ROOM_DEFS[room_key]['options']
-    return render_template('room.html', project=dict(project), room_key=room_key, room_title=ROOM_DEFS[room_key]['title'], option_fields=opt_fields, renderings=renderings)
-
-@app.route('/plan/<int:project_id>/room/<room_key>/generate', methods=['POST'])
-def generate_rendering(project_id, room_key):
-    if room_key not in ROOM_DEFS:
-        abort(404)
-    uid = current_user_id()
-    now = datetime.utcnow().isoformat()
-    # Collect options
-    options = {}
-    for f in ROOM_DEFS[room_key]['options']:
-        options[f['name']] = request.form.get(f['name'], '').strip()
-    # Generate placeholder image
-    filename = f"proj{project_id}_{room_key}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}.jpg"
-    img_path = RENDER_DIR / filename
-    title = ROOM_DEFS[room_key]['title']
-    # Text lines summarize key options
-    lines = [title, 'AI Rendering'] + [f"{k}: {v}" for k,v in options.items() if v]
-    create_placeholder_image(lines, img_path)
-
-    conn = get_db(); cur = conn.cursor()
-    cur.execute('''
-        INSERT INTO renderings (project_id,user_id,room_key,title,options_json,image_filename,created_at)
-        VALUES (?,?,?,?,?,?,?)
-    ''', (project_id, uid, room_key, title, json.dumps(options), filename, now))
-    conn.commit(); conn.close()
-    flash('Rendering created.', 'success')
-    return redirect(url_for('room', project_id=project_id, room_key=room_key))
-
-@app.route('/plan/<int:project_id>/room/<room_key>/bulk', methods=['POST'])
-def bulk_action(project_id, room_key):
-    action = request.form.get('action')
-    selected_ids = [int(x) for x in request.form.get('selected_ids','').split(',') if x.strip().isdigit()]
-    if not selected_ids:
-        flash('No renderings selected.', 'error')
-        return redirect(url_for('room', project_id=project_id, room_key=room_key))
-
-    conn = get_db(); cur = conn.cursor()
-
-    if action == 'delete':
-        cur.execute(f"SELECT id, image_filename FROM renderings WHERE project_id=? AND room_key=? AND id IN ({','.join('?'*len(selected_ids))})",
-                    (project_id, room_key, *selected_ids))
-        for row in cur.fetchall():
-            img_file = RENDER_DIR / row['image_filename']
-            if img_file.exists():
-                img_file.unlink(missing_ok=True)
-        cur.execute(f"DELETE FROM renderings WHERE project_id=? AND room_key=? AND id IN ({','.join('?'*len(selected_ids))})",
-                    (project_id, room_key, *selected_ids))
-        conn.commit()
-        flash('Deleted selected renderings.', 'success')
-
-    elif action in ('like','favorite'):
-        field = 'liked' if action=='like' else 'favorite'
-        cur.execute(f"UPDATE renderings SET {field}=1 WHERE project_id=? AND room_key=? AND id IN ({','.join('?'*len(selected_ids))})",
-                    (project_id, room_key, *selected_ids))
-        conn.commit()
-        flash(f'Marked as {field}.', 'success')
-
-    elif action == 'download':
-        # Only allow liked renderings in download per spec
-        cur.execute(f"SELECT image_filename, liked FROM renderings WHERE project_id=? AND room_key=? AND id IN ({','.join('?'*len(selected_ids))})",
-                    (project_id, room_key, *selected_ids))
-        files = [r['image_filename'] for r in cur.fetchall() if r['liked']]
-        if not files:
-            flash('Only Liked renderings can be downloaded. None selected.', 'error')
-            return redirect(url_for('room', project_id=project_id, room_key=room_key))
-        mem = io.BytesIO()
-        with zipfile.ZipFile(mem, mode='w', compression=zipfile.ZIP_DEFLATED) as zf:
-            for fn in files:
-                fp = RENDER_DIR / fn
-                if fp.exists():
-                    zf.write(fp, arcname=fn)
-        mem.seek(0)
-        return send_file(mem, as_attachment=True, download_name=f"renderings_p{project_id}_{room_key}.zip")
-
-    elif action == 'email':
-        recipient = request.form.get('recipient','').strip()
-        if not recipient:
-            flash('Recipient email required.', 'error')
-            return redirect(url_for('room', project_id=project_id, room_key=room_key))
-        cur.execute(f"SELECT image_filename, liked FROM renderings WHERE project_id=? AND room_key=? AND id IN ({','.join('?'*len(selected_ids))})",
-                    (project_id, room_key, *selected_ids))
-        rows = cur.fetchall()
-        files = [r['image_filename'] for r in rows if r['liked']]
-        if not files:
-            flash('Only Liked renderings can be emailed. None selected.', 'error')
-            return redirect(url_for('room', project_id=project_id, room_key=room_key))
-        try:
-            send_email_with_attachments(recipient, f"Architect 3D Renderings — Project {project_id}",
-                                        "Here are your selected renderings.", [RENDER_DIR / f for f in files])
-            flash('Email sent.', 'success')
-        except Exception as e:
-            flash(f'Email failed: {e}', 'error')
-
-    else:
-        flash('Unknown action.', 'error')
-
-    conn.close()
-    return redirect(url_for('room', project_id=project_id, room_key=room_key))
-
-@app.route('/slideshow/<int:project_id>')
-def slideshow(project_id):
-    conn = get_db(); cur = conn.cursor()
-    cur.execute('SELECT image_filename FROM renderings WHERE project_id=? AND favorite=1 ORDER BY id DESC', (project_id,))
-    images = [r['image_filename'] for r in cur.fetchall()]
-    conn.close()
-    if len(images) < 2:
-        flash('Need at least 2 favorites to start a slideshow.', 'error')
-        return redirect(url_for('plan', project_id=project_id))
-    return render_template('slideshow.html', images=images)
-
-# ------------------------------------------------------------
-# Email helper
-# ------------------------------------------------------------
-
-def send_email_with_attachments(to_email: str, subject: str, body: str, attachments: List[Path]):
-    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and SENDER_EMAIL):
-        raise RuntimeError('SMTP not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD, SENDER_EMAIL in .env')
-    msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = SENDER_EMAIL
-    msg['To'] = to_email
-    msg.set_content(body)
-    for p in attachments:
-        with open(p, 'rb') as f:
-            data = f.read()
-        msg.add_attachment(data, maintype='image', subtype='jpeg', filename=p.name)
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASSWORD)
-        server.send_message(msg)
-
-# ------------------------------------------------------------
-# CLI entry
-# ------------------------------------------------------------
-
-if __name__ == '__main__':
-    ensure_dirs_and_templates()
+@app.before_first_request
+def setup():
     init_db()
-    app.run(debug=True)
+
+
+# -----------------------------
+# Error Handlers
+# -----------------------------
+@app.errorhandler(403)
+@app.errorhandler(404)
+@app.errorhandler(500)
+def errs(e):
+    flash(str(e), 'warning')
+    return redirect(url_for('index'))
+
+
+# -----------------------------
+# Entry
+# -----------------------------
+if __name__ == '__main__':
+    init_db()
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '5000')))
