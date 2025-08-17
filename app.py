@@ -755,7 +755,8 @@ def write_template_files_if_missing():
   </form>
 </section>
 <script>
-  const OPTIONS = {{ options|tojson if options else (namespace().update({'o': True}) and {}) }};
+  # const OPTIONS = {{ options|tojson if options else (namespace().update({'o': True}) and {}) }};
+  const OPTIONS = {{ options|default({})|tojson }};
 </script>
 {% endif %}
 
@@ -986,3 +987,4 @@ window.addEventListener('DOMContentLoaded', ()=>{
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
