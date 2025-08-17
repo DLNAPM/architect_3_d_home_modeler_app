@@ -438,11 +438,13 @@ def generate():
 
     rooms = build_room_list(description)
     flash("Generated Front & Back exterior renderings!", "success")
+    # Pass options so gallery template JS always has it
     return render_template("gallery.html",
                            app_name=APP_NAME,
                            user=current_user(),
                            new_images=[{"subcategory": s, "path": p} for s, p, _ in paths],
-                           rooms=rooms)
+                           rooms=rooms,
+                           options=OPTIONS)
 
 @app.post("/generate_room")
 def generate_room():
@@ -494,7 +496,8 @@ def gallery():
     fav_count = sum(1 for r in items if r["favorited"])
     return render_template("gallery.html",
                            app_name=APP_NAME, user=user, items=items,
-                           show_slideshow=(fav_count >= 2))
+                           show_slideshow=(fav_count >= 2),
+                           options=OPTIONS)
 
 @app.post("/bulk_action")
 def bulk_action():
@@ -755,7 +758,7 @@ def write_template_files_if_missing():
   </form>
 </section>
 <script>
-  # const OPTIONS = {{ options|tojson if options else (namespace().update({'o': True}) and {}) }};
+  // Fixed: safe default for missing options
   const OPTIONS = {{ options|default({})|tojson }};
 </script>
 {% endif %}
@@ -797,7 +800,7 @@ def write_template_files_if_missing():
 
 <script>
   // Room dynamic options injection
-  const ALL = {{ options|tojson }};
+  const ALL = {{ options|default({})|tojson }};
   const select = document.getElementById('roomSelect');
   const container = document.getElementById('roomOptions');
   function renderRoomOptions() {
@@ -987,4 +990,3 @@ window.addEventListener('DOMContentLoaded', ()=>{
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
-
