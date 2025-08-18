@@ -899,7 +899,6 @@ def write_basic_static_if_missing():
 :root { --bg:#0b0f14; --card:#141a22; --text:#e8eef7; --muted:#9fb0c6; --accent:#6aa6ff; --danger:#ff6a6a; }
 *{box-sizing:border-box} body.page{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Segoe UI,Roboto,Arial}
 .brand{color:var(--text);text-decoration:none;font-weight:700}
-.nav a{color:var(--muted);margin-left:14px;text-decoration:none}
 .container{max-width:1100px;margin:20px auto;padding:0 16px}
 .card{background:var(--card);border:1px solid #1f2835;padding:16px;border-radius:10px;margin-bottom:16px}
 .row{display:flex;align-items:center} .space{justify-content:space-between} .gap>*{margin-right:8px}
@@ -965,6 +964,7 @@ window.addEventListener('DOMContentLoaded', ()=>{
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
