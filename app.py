@@ -914,30 +914,12 @@ def write_basic_static_if_missing():
             ".button{background:#2a3546;color:#e8eef7;padding:8px 12px;border-radius:8px;text-decoration:none}",
             ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}",
             ".render-card{position:relative;background:#0e141b;border:1px solid #1d2533;border-radius:12px;padding:10px}",
-            ".render-card.selectable{cursor:pointer}",
-            ".render-card input[type=checkbox]{position:absolute;top:8px;left:8px;transform:scale(1.2)}",
-            ".render-img{width:100%;height:auto;border-radius:8px;display:block;transition:filter .2s ease;cursor:pointer}",
-            ".render-img.dark{filter:brightness(.7) contrast(1.1)}",
-            ".dark-toggle{margin-top:8px;background:#223047;color:#cfe3ff;border:0;padding:6px 8px;border-radius:6px;cursor:pointer}",
-            ".meta{margin-top:6px}.tag{font-size:12px;color:#c5d3e9;background:#212c3b;padding:3px 6px;border-radius:999px;margin-right:6px}",
-            ".tag.like{background:#1d3c2a;color:#9ef2b0}.tag.fav{background:#3a2a4a;color:#e3b8ff}",
-            ".flashes .flash{padding:10px;margin:8px 0;border-radius:8px}",
-            ".flash.success{background:#14301d;color:#9ef2b0}.flash.warning{background:#332c17;color:#ffe28a}",
-            ".flash.info{background:#173246;color:#a5d9ff}.flash.danger{background:#351b1b;color:#ffb6b6}",
-            ".pill-list{list-style:none;padding:0;display:flex;flex-wrap:wrap}",
-            ".pill-list li{padding:6px 10px;background:#202b3a;border:1px solid #2a3546;margin:6px;border-radius:999px}",
-            ".options-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:12px}",
-            ".opt label{display:block;font-size:13px;margin-bottom:6px;color:#cfe3ff}",
-            ".opt select, textarea, input[type=text], input[type=email], input[type=password], select{width:100%;padding:8px;border:1px solid #2a3546;border-radius:6px;background:#0c1219;color:#dbe6f6}",
-            ".footer{padding:24px;text-align:center;color:#88a2c2}",
-            "h1,h2{margin-top:0}",
-
-            /* Modal (fullscreen image) */
+            ".render-img{width:100%;height:auto;border-radius:8px;cursor:pointer}",
             ".modal{display:none;position:fixed;z-index:2000;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,.9)}",
             ".modal-content{display:block;max-width:95%;max-height:95%;margin:auto;border-radius:8px}",
             ".close{position:absolute;top:16px;right:24px;font-size:36px;color:#fff;cursor:pointer}",
-            ".voice-box{position:relative;display:flex;gap:8px;align-items:stretch}",
-            ".voice-btn{background:#223047;color:#cfe3ff;border:0;border-radius:6px;padding:0 10px;cursor:pointer}",
+            ".voice-box{display:flex;gap:8px;align-items:center}",
+            ".voice-btn{background:#223047;color:#cfe3ff;border:0;border-radius:6px;padding:6px 10px;cursor:pointer}",
         ]
         css_path.write_text("\n".join(css_lines), encoding="utf-8")
 
@@ -946,7 +928,7 @@ def write_basic_static_if_missing():
     if not js_path.exists():
         js_lines = [
             "// Default JS for Architect 3D Home Modeler",
-
+            "",
             "// Fullscreen modal image viewer",
             "document.addEventListener('click', function(e){",
             "  const img = e.target.closest('.render-img');",
@@ -964,7 +946,7 @@ def write_basic_static_if_missing():
             "  const modal = document.getElementById('imageModal');",
             "  if(modal) modal.style.display = 'none';",
             "};",
-
+            "",
             "// Voice input for Describe Changes",
             "window.startVoice = function(id){",
             "  if(!('webkitSpeechRecognition' in window)){",
@@ -983,14 +965,14 @@ def write_basic_static_if_missing():
         ]
         js_path.write_text("\n".join(js_lines), encoding="utf-8")
 
-    # -------- Favicon (if missing) --------
-    from PIL import Image, ImageDraw
+    # -------- Favicon --------
     ico = STATIC_DIR / "favicon.ico"
     if not ico.exists():
-        img = Image.new("RGBA", (64,64), (10,16,24,255))
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (64, 64), (10, 16, 24, 255))
         d = ImageDraw.Draw(img)
-        d.rectangle([8,8,56,56], outline=(106,166,255,255), width=3)
-        d.text((16,22), "A3", fill=(200,220,255,255))
+        d.rectangle([8, 8, 56, 56], outline=(106, 166, 255, 255), width=3)
+        d.text((16, 22), "A3", fill=(200, 220, 255, 255))
         img.save(ico, format="ICO")
 
 
@@ -999,6 +981,7 @@ def write_basic_static_if_missing():
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
