@@ -10,6 +10,14 @@ Architect 3D Home Modeler – Flask 3.x single-file app
 - Dark mode toggle per rendering (CSS filter)
 - @app.before_request + guard for one-time init (Flask 3.x safe)
 - Auto-scaffold templates/ and static/ on first run
+# ---------Recent Updates 08182025 -----------
+- Click any rendering and enlarde to fullscreen modal view
+- Type or speak “Describe Changes” on any "Rooms" and generate a new rendering
+- Modify any Generated Rendering by adding or taking away any configured options on the Renderting
+- Click on a "Back to Rooms" button in slideshow
+- Be able to modify the Front and Back Exterior Renderings as well
+- Also make sure there are no "Swimming Pools" on the Front Exterior
+
 
 Requirements (create requirements.txt with these):
 -------------------------------------------------
@@ -315,9 +323,15 @@ def build_room_list(description: str):
     return rooms
 
 def build_prompt(subcategory: str, options_map: dict, description: str, plan_uploaded: bool):
-    """Create a concise, directive prompt for image generation."""
     selections = ", ".join([f"{k}: {v}" for k, v in options_map.items() if v and v != "None"])
     plan_hint = "Consider the uploaded architectural plan as a guide. " if plan_uploaded else ""
+
+    # Prevent pools on Front Exterior
+    if subcategory == "Front Exterior" and "pool" in description.lower():
+        description = description.replace("pool", "")
+    if subcategory == "Front Exterior":
+        selections = ", ".join([s for s in selections.split(", ") if "pool" not in s.lower()])
+
     base = (
         f"High-quality photorealistic {subcategory} rendering for a residential home. "
         f"{plan_hint}"
@@ -587,6 +601,46 @@ def slideshow():
         flash("Favorite at least two renderings to start a slideshow.", "info")
         return redirect(url_for("gallery"))
     return render_template("slideshow.html", app_name=APP_NAME, user=current_user(), items=items)
+
+# --- new endpoint to modify an existing rendering ---
+@app.post("/modify_rendering")
+def modify_rendering():
+    """Take an existing rendering, apply new description/options, regenerate."""
+    rid = request.form.get("rendering_id")
+    description = request.form.get("description", "")
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM renderings WHERE id=?", (rid,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        flash("Rendering not found.", "danger")
+        return redirect(url_for("gallery"))
+
+    subcategory = row["subcategory"]
+    # collect updated options
+    selected = {}
+    if subcategory in OPTIONS:
+        for opt_name in OPTIONS[subcategory].keys():
+            selected[opt_name] = request.form.get(opt_name) or json.loads(row["options_json"]).get(opt_name)
+
+    prompt = build_prompt(subcategory, selected, description, False)
+    try:
+        rel_path = generate_image_via_openai(prompt)
+    except Exception as e:
+        flash(f"Modification failed: {e}", "danger")
+        return redirect(url_for("gallery"))
+
+    now = datetime.utcnow().isoformat()
+    cur.execute("""
+        INSERT INTO renderings (user_id, category, subcategory, options_json, prompt, image_path, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (row["user_id"], row["category"], subcategory, json.dumps(selected), prompt, rel_path, now))
+    conn.commit()
+    conn.close()
+    flash(f"Modified {subcategory} rendering!", "success")
+    return redirect(url_for("gallery"))
+
 
 # ---------- Auth ----------
 
@@ -862,6 +916,66 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
 
+{% extends "layout.html" %}{% block content %}
+<h1>Your Renderings</h1>
+
+<div id="imageModal" class="modal" style="display:none;">
+  <span id="closeModal" class="close">&times;</span>
+  <img class="modal-content" id="modalImg">
+  <div id="caption"></div>
+</div>
+
+<form class="card" action="{{ url_for('bulk_action') }}" method="post" id="bulkForm">
+  <div class="grid">
+    {% for r in items %}
+    <div class="render-card">
+      <input type="checkbox" name="rendering_ids" value="{{ r['id'] }}">
+      <img src="{{ url_for('static', filename=r['image_path']) }}" 
+           alt="{{ r['subcategory'] }}"
+           class="render-img modal-trigger" data-id="{{ r['id'] }}">
+      <div class="meta">
+        <span class="tag">{{ r['subcategory'] }}</span>
+      </div>
+      <form action="{{ url_for('modify_rendering') }}" method="post">
+        <input type="hidden" name="rendering_id" value="{{ r['id'] }}">
+        <textarea name="description" rows="2" placeholder="Describe Changes..."></textarea>
+        {% if options[r['subcategory']] %}
+        <div class="options-grid">
+          {% for opt, vals in options[r['subcategory']].items() %}
+          <label>{{ opt }}
+            <select name="{{ opt }}">
+              {% for v in vals %}
+              <option value="{{ v }}">{{ v }}</option>
+              {% endfor %}
+            </select>
+          </label>
+          {% endfor %}
+        </div>
+        {% endif %}
+        <button type="submit">Modify Rendering</button>
+      </form>
+    </div>
+    {% endfor %}
+  </div>
+</form>
+
+<script>
+  // Fullscreen modal
+  const modal=document.getElementById("imageModal");
+  const modalImg=document.getElementById("modalImg");
+  const caption=document.getElementById("caption");
+  document.querySelectorAll('.modal-trigger').forEach(img=>{
+    img.addEventListener('click',()=>{
+      modal.style.display="block";
+      modalImg.src=img.src;
+      caption.innerHTML=img.alt;
+    });
+  });
+  document.getElementById("closeModal").onclick=()=>modal.style.display="none";
+</script>
+{% endblock %}
+
+
     # slideshow.html
     (TEMPLATES_DIR / "slideshow.html").write_text("""{% extends "layout.html" %}{% block content %}
 <h1>Favorites Slideshow</h1>
@@ -874,16 +988,15 @@ def write_template_files_if_missing():
   <button id="prev">Prev</button>
   <button id="next">Next</button>
   <button id="toggleDark">🌙 Toggle Dark</button>
+  <a href="{{ url_for('gallery') }}" class="button">⬅ Back to Rooms</a>
 </div>
 <script>
-  const slides = Array.from(document.querySelectorAll('.slide'));
-  let idx = 0;
-  function show(i){
-    slides.forEach((s, j)=> s.style.display = (i===j?'block':'none'));
-  }
-  document.getElementById('prev').onclick=()=>{ idx=(idx-1+slides.length)%slides.length; show(idx); };
-  document.getElementById('next').onclick=()=>{ idx=(idx+1)%slides.length; show(idx); };
-  document.getElementById('toggleDark').onclick=()=>{ slides[idx].classList.toggle('dark'); };
+  const slides=[...document.querySelectorAll('.slide')];
+  let idx=0;
+  function show(i){slides.forEach((s,j)=>s.style.display=(i===j?'block':'none'));}
+  document.getElementById('prev').onclick=()=>{idx=(idx-1+slides.length)%slides.length;show(idx);}
+  document.getElementById('next').onclick=()=>{idx=(idx+1)%slides.length;show(idx);}
+  document.getElementById('toggleDark').onclick=()=>{slides[idx].classList.toggle('dark');};
 </script>
 {% endblock %}
 """, encoding="utf-8")
