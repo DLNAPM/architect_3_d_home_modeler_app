@@ -893,37 +893,129 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
 
+import os
+
 def write_basic_static_if_missing():
-    # CSS
-    (STATIC_DIR / "app.css").write_text("""
-:root { --bg:#0b0f14; --card:#141a22; --text:#e8eef7; --muted:#9fb0c6; --accent:#6aa6ff; --danger:#ff6a6a; }
-*{box-sizing:border-box} body.page{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Segoe UI,Roboto,Arial}
-.brand{color:var(--text);text-decoration:none;font-weight:700}
-.file input{display:none} .file span{border:1px dashed #2a3546;padding:10px;border-radius:6px;cursor:pointer}
-.primary{background:var(--accent);color:#06101e;border:0;padding:10px 14px;border-radius:8px;cursor:pointer}
-.button{background:#2a3546;color:var(--text);padding:8px 12px;border-radius:8px;text-decoration:none}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
-.render-card{position:relative;background:#0e141b;border:1px solid #1d2533;border-radius:12px;padding:10px}
-.render-card.selectable{cursor:pointer}
-.render-card input[type=checkbox]{position:absolute;top:8px;left:8px;transform:scale(1.2)}
-.render-img{width:100%;height:auto;border-radius:8px;display:block;transition:filter .2s ease}
-.render-img.dark{filter:brightness(.7) contrast(1.1)}
-.dark-toggle{margin-top:8px;background:#223047;color:#cfe3ff;border:0;padding:6px 8px;border-radius:6px;cursor:pointer}
-.meta{margin-top:6px} .tag{font-size:12px;color:#c5d3e9;background:#212c3b;padding:3px 6px;border-radius:999px;margin-right:6px}
-.tag.like{background:#1d3c2a;color:#9ef2b0} .tag.fav{background:#3a2a4a;color:#e3b8ff}
-.flashes .flash{padding:10px;margin:8px 0;border-radius:8px}
-.flash.success{background:#14301d;color:#9ef2b0}
-.flash.warning{background:#332c17;color:#ffe28a}
-.flash.info{background:#173246;color:#a5d9ff}
-.flash.danger{background:#351b1b;color:#ffb6b6}
-.pill-list{list-style:none;padding:0;display:flex;flex-wrap:wrap}
-.pill-list li{padding:6px 10px;background:#202b3a;border:1px solid #2a3546;margin:6px;border-radius:999px}
-.options-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:12px}
-.opt label{display:block;font-size:13px;margin-bottom:6px;color:#cfe3ff}
-.opt select, textarea, input[type=text], input[type=email], input[type=password], select {width:100%;padding:8px;border:1px solid #2a3546;border-radius:6px;background:#0c1219;color:#dbe6f6}
-.footer{padding:24px;text-align:center;color:#88a2c2}
-h1,h2{margin-top:0}
-""", encoding="utf-8")
+    """Ensure basic static files exist for CSS/JS on first run."""
+    os.makedirs("static", exist_ok=True)
+
+    # ---------------- CSS ----------------
+    css_path = os.path.join("static", "style.css")
+    if not os.path.exists(css_path):
+        css_content = """/* Default stylesheet for Architect 3D Home Modeler */
+
+body {
+  font-family: Arial, sans-serif;
+  margin: 0;
+  padding: 0;
+  background: #f8f9fa;
+  color: #222;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #1f2835;
+  background: #0e131a;
+  color: white;
+}
+
+.btn {
+  padding: 8px 12px;
+  cursor: pointer;
+  border: none;
+  border-radius: 4px;
+  background: #1f6feb;
+  color: white;
+}
+
+.btn:hover {
+  background: #1558b0;
+}
+
+.gallery {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+}
+
+.render-card {
+  border: 1px solid #ddd;
+  padding: 10px;
+  width: 300px;
+  background: #fff;
+}
+
+.render-img {
+  width: 100%;
+  cursor: pointer;
+}
+
+.modal {
+  display: none;
+  position: fixed;
+  z-index: 2000;
+  left: 0; top: 0;
+  width: 100%; height: 100%;
+  background: rgba(0,0,0,0.9);
+}
+
+.modal-content {
+  display: block;
+  max-width: 95%;
+  max-height: 95%;
+  margin: auto;
+}
+
+.close {
+  position: absolute;
+  top: 20px;
+  right: 30px;
+  font-size: 40px;
+  color: #fff;
+  cursor: pointer;
+}
+"""
+        with open(css_path, "w") as f:
+            f.write(css_content)
+
+    # ---------------- JS ----------------
+    js_path = os.path.join("static", "app.js")
+    if not os.path.exists(js_path):
+        js_content = """// Default JavaScript for Architect 3D Home Modeler
+
+// Fullscreen modal image viewer
+function enlargeImage(img) {
+  const modal = document.getElementById("imageModal");
+  const modalImg = document.getElementById("modalImg");
+  modal.style.display = "block";
+  modalImg.src = img.src;
+}
+function closeModal() {
+  document.getElementById("imageModal").style.display = "none";
+}
+
+// Voice input for "Describe Changes"
+function startVoice(id) {
+  if (!('webkitSpeechRecognition' in window)) {
+    alert("Voice recognition not supported in this browser.");
+    return;
+  }
+  const recognition = new webkitSpeechRecognition();
+  recognition.lang = "en-US";
+  recognition.start();
+
+  recognition.onresult = function(event) {
+    const text = event.results[0][0].transcript;
+    document.getElementById("desc-" + id).value = text;
+  };
+}
+"""
+        with open(js_path, "w") as f:
+            f.write(js_content)
+
 
     # JS (voice input + small helpers)
     (STATIC_DIR / "app.js").write_text("""
@@ -961,6 +1053,7 @@ window.addEventListener('DOMContentLoaded', ()=>{
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
