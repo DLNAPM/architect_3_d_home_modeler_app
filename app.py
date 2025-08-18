@@ -849,7 +849,7 @@ def write_template_files_if_missing():
 <div class="row gap">
   <button id="prev">Prev</button>
   <button id="next">Next</button>
-  <button id="toggleDark">🌙 Toggle Dark</button>
+  <button id="toggleDark"> Toggle Dark</button>
   <a href="{{ url_for('gallery') }}" class="button">⬅ Back to Rooms</a>
 </div>
 <script>
@@ -965,3 +965,4 @@ window.addEventListener('DOMContentLoaded', ()=>{
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
