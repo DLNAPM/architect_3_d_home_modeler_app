@@ -10,6 +10,10 @@ Architect 3D Home Modeler – Flask 3.x single-file app
 - Dark mode toggle per rendering (CSS filter)
 - @app.before_request + guard for one-time init (Flask 3.x safe)
 - Auto-scaffold templates/ and static/ on first run
+- Updates 8/16/2025
+- Users can click → enlarge renderings
+- They can type or speak “describe changes” → new rendering generated
+- They can exit slideshow → return to Rooms page
 
 Requirements (create requirements.txt with these):
 -------------------------------------------------
@@ -61,6 +65,49 @@ app.config["SECRET_KEY"] = os.getenv("SECRET_KEY") or os.urandom(32)
 # One-time init guard
 app.config.setdefault("DB_INITIALIZED", False)
 app.config.setdefault("FS_INITIALIZED", False)
+
+# -------------------------
+# DB Helpers
+# -------------------------
+def init_db():
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("""CREATE TABLE IF NOT EXISTS renderings (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        url TEXT,
+                        prompt TEXT,
+                        category TEXT,
+                        created TIMESTAMP
+                    )""")
+        conn.commit()
+
+def db_save_rendering(url, prompt, category, user_id=None):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO renderings (user_id, url, prompt, category, created) VALUES (?,?,?,?,?)",
+                  (user_id, url, prompt, category, datetime.utcnow()))
+        conn.commit()
+        return c.lastrowid
+
+def db_get_renderings(user_id=None):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        if user_id:
+            c.execute("SELECT id, url, prompt, category FROM renderings WHERE user_id=? ORDER BY created DESC", (user_id,))
+        else:
+            c.execute("SELECT id, url, prompt, category FROM renderings ORDER BY created DESC")
+        rows = c.fetchall()
+        return [{"id": r[0], "url": r[1], "prompt": r[2], "category": r[3]} for r in rows]
+
+def db_get_rendering(rid):
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT id, url, prompt, category FROM renderings WHERE id=?", (rid,))
+        row = c.fetchone()
+        if row:
+            return {"id": row[0], "url": row[1], "prompt": row[2], "category": row[3]}
+        return None
 
 # Email envs
 MAIL_SERVER = os.getenv("MAIL_SERVER")
@@ -133,11 +180,20 @@ def init_db_once():
     conn.close()
     app.config["DB_INITIALIZED"] = True
 
+# -------------------------
+# Before request (Flask 3.x safe)
+# -------------------------
 @app.before_request
 def before_request():
     # One-time filesystem & DB init, Flask 3.x safe
     init_fs_once()
     init_db_once()
+@app.before_request
+def ensure_db():
+    global _db_initialized
+    if not _db_initialized:
+        init_db()
+        _db_initialized = True
 
 def login_required(f):
     @wraps(f)
@@ -386,207 +442,73 @@ def send_email_with_images(to_email: str, subject: str, body: str, image_paths: 
         s.login(MAIL_USERNAME, MAIL_PASSWORD)
         s.send_message(msg)
 
-# ---------- Routes ----------
-
+# -------------------------
+# Routes
+# -------------------------
 @app.route("/")
 def index():
-    user = current_user()
-    return render_template("index.html",
-                           app_name=APP_NAME,
-                           user=user,
-                           options=OPTIONS,
-                           basic_rooms=BASIC_ROOMS)
+    return render_template("index.html")
 
-@app.post("/generate")
+@app.route("/generate", methods=["POST"])
 def generate():
-    """Generate Front & Back exteriors immediately, then show rooms."""
-    description = request.form.get("description", "").strip()
-    plan_file = request.files.get("plan_file")
-    plan_uploaded = False
+    desc = request.form.get("description", "")
+    user_id = session.get("user_id", "guest")
 
-    if plan_file and plan_file.filename:
-        plan_uploaded = True
-        safe_name = f"{uuid.uuid4().hex}_{plan_file.filename}"
-        plan_path = UPLOAD_DIR / safe_name
-        plan_file.save(plan_path)
+    # generate 2 exteriors using OpenAI
+    prompts = [f"Front Exterior of a dream home: {desc}",
+               f"Back Exterior of a dream home: {desc}"]
 
-    # FRONT & BACK prompts
-    front_prompt = build_prompt("Front Exterior", OPTIONS["Front Exterior"], description, plan_uploaded)
-    back_prompt  = build_prompt("Back Exterior",  OPTIONS["Back Exterior"],  description, plan_uploaded)
+    renderings = []
+    for p in prompts:
+        result = openai.images.generate(
+            model="gpt-image-1",
+            prompt=p,
+            size="1024x1024"
+        )
+        url = result.data[0].url
+        rid = db_save_rendering(url, p, "Exterior", user_id=user_id)
+        renderings.append({"id": rid, "url": url, "prompt": p, "category": "Exterior"})
 
-    paths = []
-    for subcat, prompt in [("Front Exterior", front_prompt), ("Back Exterior", back_prompt)]:
-        try:
-            rel_path = generate_image_via_openai(prompt)
-            paths.append((subcat, rel_path, prompt))
-        except Exception as e:
-            flash(str(e), "danger")
-            return redirect(url_for("index"))
+    return render_template("gallery.html", renderings=renderings)
 
-    user_id = session.get("user_id")
-    conn = get_db()
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-
-    for subcat, rel_path, prompt in paths:
-        cur.execute("""
-            INSERT INTO renderings (user_id, category, subcategory, options_json, prompt, image_path, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, "EXTERIOR", subcat, json.dumps({}), prompt, rel_path, now))
-    conn.commit()
-    conn.close()
-
-    rooms = build_room_list(description)
-    flash("Generated Front & Back exterior renderings!", "success")
-    # Pass options so gallery template JS always has it
-    return render_template("gallery.html",
-                           app_name=APP_NAME,
-                           user=current_user(),
-                           new_images=[{"subcategory": s, "path": p} for s, p, _ in paths],
-                           rooms=rooms,
-                           options=OPTIONS)
-
-@app.post("/generate_room")
-def generate_room():
-    """Generate a room rendering from dropdown options."""
-    subcategory = request.form.get("subcategory")  # e.g., "Living Room"
-    description = request.form.get("description", "")
-    plan_uploaded = request.form.get("plan_uploaded") == "1"  # from hidden field if needed
-
-    # Collect selected room options
-    selected = {}
-    if subcategory in OPTIONS:
-        for opt_name in OPTIONS[subcategory].keys():
-            selected[opt_name] = request.form.get(opt_name)
-
-    prompt = build_prompt(subcategory, selected, description, plan_uploaded)
-    try:
-        rel_path = generate_image_via_openai(prompt)
-    except Exception as e:
-        flash(str(e), "danger")
-        return redirect(url_for("index"))
-
-    user_id = session.get("user_id")
-    conn = get_db()
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-    cur.execute("""
-        INSERT INTO renderings (user_id, category, subcategory, options_json, prompt, image_path, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (user_id, "ROOM", subcategory, json.dumps(selected), prompt, rel_path, now))
-    conn.commit()
-    conn.close()
-
-    flash(f"Generated {subcategory} rendering!", "success")
-    return redirect(url_for("gallery"))
-
-@app.get("/gallery")
+@app.route("/gallery")
 def gallery():
-    user = current_user()
-    conn = get_db()
-    cur = conn.cursor()
-    # show all (or user-scoped if logged in)
-    if user:
-        cur.execute("""SELECT * FROM renderings WHERE user_id IS NULL OR user_id = ? ORDER BY created_at DESC""", (user["id"],))
-    else:
-        cur.execute("""SELECT * FROM renderings ORDER BY created_at DESC""")
-    items = [dict(row) for row in cur.fetchall()]
-    conn.close()
+    user_id = session.get("user_id", "guest")
+    renderings = db_get_renderings(user_id)
+    return render_template("gallery.html", renderings=renderings)
 
-    fav_count = sum(1 for r in items if r["favorited"])
-    return render_template("gallery.html",
-                           app_name=APP_NAME, user=user, items=items,
-                           show_slideshow=(fav_count >= 2),
-                           options=OPTIONS)
+@app.route("/describe_changes", methods=["POST"])
+def describe_changes():
+    data = request.get_json()
+    rid = data.get("id")
+    change_text = data.get("description", "")
+    user_id = session.get("user_id", "guest")
 
-@app.post("/bulk_action")
-def bulk_action():
-    """Handle multi-select actions: like, favorite, delete, email, download list."""
-    action = request.form.get("action")
-    ids = request.form.getlist("rendering_ids")
-    if not ids:
-        flash("No renderings selected.", "warning")
-        return redirect(url_for("gallery"))
+    rendering = db_get_rendering(rid)
+    if not rendering:
+        return jsonify({"success": False, "error": "Rendering not found"}), 404
 
-    conn = get_db()
-    cur = conn.cursor()
+    new_prompt = f"Modify this design: {rendering['prompt']}. User requested changes: {change_text}"
 
-    if action == "delete":
-        q_marks = ",".join("?" for _ in ids)
-        cur.execute(f"SELECT image_path FROM renderings WHERE id IN ({q_marks})", ids)
-        paths = [row["image_path"] for row in cur.fetchall()]
-        for rel in paths:
-            try:
-                os.remove(STATIC_DIR / rel)
-            except Exception:
-                pass
-        cur.execute(f"DELETE FROM renderings WHERE id IN ({q_marks})", ids)
-        conn.commit()
-        conn.close()
-        flash(f"Deleted {len(ids)} rendering(s).", "success")
+    result = openai.images.generate(
+        model="gpt-image-1",
+        prompt=new_prompt,
+        size="1024x1024"
+    )
+    url = result.data[0].url
+    new_id = db_save_rendering(url, new_prompt, rendering["category"], user_id)
 
-    elif action in ("like", "unlike", "favorite", "unfavorite"):
-        val = 1 if action in ("like", "favorite") else 0
-        field = "liked" if "like" in action else "favorited"
-        q_marks = ",".join("?" for _ in ids)
-        cur.execute(f"UPDATE renderings SET {field} = ? WHERE id IN ({q_marks})", (val, *ids))
-        conn.commit()
-        conn.close()
-        verb = "Liked" if field == "liked" and val else "Unliked" if field == "liked" else "Favorited" if val else "Unfavorited"
-        flash(f"{verb} {len(ids)} rendering(s).", "success")
+    return jsonify({"success": True, "new_id": new_id, "new_url": url})
 
-    elif action == "email":
-        to_email = request.form.get("to_email")
-        if not to_email:
-            conn.close()
-            flash("Please provide a destination email.", "warning")
-            return redirect(url_for("gallery"))
-        # Only send liked renderings
-        q_marks = ",".join("?" for _ in ids)
-        cur.execute(f"SELECT image_path, liked FROM renderings WHERE id IN ({q_marks})", ids)
-        rows = cur.fetchall()
-        send_paths = [r["image_path"] for r in rows if r["liked"]]
-        conn.close()
-        if not send_paths:
-            flash("Only 'Liked' renderings can be emailed. None selected were liked.", "warning")
-            return redirect(url_for("gallery"))
-        try:
-            send_email_with_images(
-                to_email,
-                subject=f"{APP_NAME}: Selected Renderings",
-                body="Here are the renderings you requested.",
-                image_paths=send_paths
-            )
-            flash(f"Emailed {len(send_paths)} rendering(s) to {to_email}.", "success")
-        except Exception as e:
-            flash(f"Email failed: {e}", "danger")
-
-    elif action == "download":
-        # Return a JSON list of static URLs to download individually (UI handles)
-        q_marks = ",".join("?" for _ in ids)
-        cur.execute(f"SELECT id, image_path FROM renderings WHERE id IN ({q_marks})", ids)
-        rows = cur.fetchall()
-        conn.close()
-        urls = [url_for("static", filename=row["image_path"], _external=False) for row in rows]
-        return jsonify({"download_urls": urls})
-
-    else:
-        conn.close()
-        flash("Unknown action.", "danger")
-
-    return redirect(url_for("gallery"))
-
-@app.get("/slideshow")
+@app.route("/slideshow")
 def slideshow():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM renderings WHERE favorited = 1 ORDER BY created_at DESC")
-    items = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    if len(items) < 2:
-        flash("Favorite at least two renderings to start a slideshow.", "info")
-        return redirect(url_for("gallery"))
-    return render_template("slideshow.html", app_name=APP_NAME, user=current_user(), items=items)
+    user_id = session.get("user_id", "guest")
+    renderings = db_get_renderings(user_id)
+    return render_template("slideshow.html", renderings=renderings)
+
+@app.route("/rooms")
+def rooms():
+    return render_template("rooms.html")
 
 # ---------- Auth ----------
 
@@ -862,6 +784,113 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
 
+{% extends "layout.html" %}
+{% block content %}
+<h2>Your Renderings</h2>
+
+<div class="gallery">
+  {% for rendering in renderings %}
+  <div class="rendering-card">
+    <img src="{{ rendering.url }}" 
+         class="rendering-thumb" 
+         onclick="enlargeImage(this)" />
+
+    <p><strong>{{ rendering.category }}</strong></p>
+    <p>{{ rendering.prompt }}</p>
+
+    <div class="change-request">
+      <textarea id="changeText-{{ rendering.id }}" 
+                placeholder="Describe changes..."></textarea>
+      <button onclick="submitChange('{{ rendering.id }}')">Submit</button>
+      <button onclick="startVoice('{{ rendering.id }}')">🎤 Speak</button>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- Modal for fullscreen -->
+<div id="imageModal" class="modal" onclick="closeModal()">
+  <img id="modalImage" class="modal-content">
+</div>
+
+<style>
+.gallery {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+}
+.rendering-card {
+  border: 1px solid #ddd;
+  padding: 10px;
+  width: 300px;
+}
+.rendering-thumb {
+  width: 100%;
+  cursor: pointer;
+}
+.modal {
+  display: none;
+  position: fixed;
+  z-index: 2000;
+  left: 0; top: 0;
+  width: 100%; height: 100%;
+  background: rgba(0,0,0,0.9);
+}
+.modal-content {
+  display: block;
+  max-width: 95%;
+  max-height: 95%;
+  margin: auto;
+}
+</style>
+
+<script>
+function enlargeImage(img) {
+  const modal = document.getElementById("imageModal");
+  const modalImg = document.getElementById("modalImage");
+  modal.style.display = "block";
+  modalImg.src = img.src;
+}
+function closeModal() {
+  document.getElementById("imageModal").style.display = "none";
+}
+
+function startVoice(renderingId) {
+  if (!('webkitSpeechRecognition' in window)) {
+    alert("Voice recognition not supported in this browser.");
+    return;
+  }
+  const recognition = new webkitSpeechRecognition();
+  recognition.lang = "en-US";
+  recognition.start();
+
+  recognition.onresult = function(event) {
+    const text = event.results[0][0].transcript;
+    document.getElementById("changeText-" + renderingId).value = text;
+  };
+}
+
+function submitChange(renderingId) {
+  const changeText = document.getElementById("changeText-" + renderingId).value;
+  fetch("/describe_changes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: renderingId, description: changeText })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.success) {
+      alert("AI is generating changes!");
+      location.reload();
+    } else {
+      alert("Error: " + data.error);
+    }
+  });
+}
+</script>
+{% endblock %}
+
+
     # slideshow.html
     (TEMPLATES_DIR / "slideshow.html").write_text("""{% extends "layout.html" %}{% block content %}
 <h1>Favorites Slideshow</h1>
@@ -887,6 +916,65 @@ def write_template_files_if_missing():
 </script>
 {% endblock %}
 """, encoding="utf-8")
+
+{% extends "layout.html" %}
+{% block content %}
+<h2>Slideshow of Favorites</h2>
+
+<div id="slideshow-container">
+  {% for rendering in renderings %}
+  <div class="slide" style="display: {% if loop.first %}block{% else %}none{% endif %};">
+    <img src="{{ rendering.url }}" class="slide-img">
+    <p>{{ rendering.category }} - {{ rendering.prompt }}</p>
+  </div>
+  {% endfor %}
+</div>
+
+<div class="controls">
+  <button onclick="prevSlide()">⏮ Prev</button>
+  <button onclick="nextSlide()">Next ⏭</button>
+</div>
+
+<!-- Back to Rooms button -->
+<div class="back-btn" onclick="window.location.href='{{ url_for('rooms') }}'">⬅ Back to Rooms</div>
+
+<style>
+.slide-img { max-width: 90%; max-height: 80vh; }
+.controls { margin-top: 20px; }
+.back-btn {
+  position: fixed;
+  top: 20px;
+  left: 20px;
+  background: #333;
+  color: white;
+  padding: 10px 15px;
+  border-radius: 6px;
+  z-index: 2100;
+  cursor: pointer;
+}
+</style>
+
+<script>
+let current = 0;
+const slides = document.getElementsByClassName("slide");
+
+function showSlide(idx) {
+  for (let i = 0; i < slides.length; i++) {
+    slides[i].style.display = "none";
+  }
+  slides[idx].style.display = "block";
+}
+function nextSlide() {
+  current = (current + 1) % slides.length;
+  showSlide(current);
+}
+function prevSlide() {
+  current = (current - 1 + slides.length) % slides.length;
+  showSlide(current);
+}
+</script>
+{% endblock %}
+
 
     # login.html
     (TEMPLATES_DIR / "login.html").write_text("""{% extends "layout.html" %}{% block content %}
@@ -989,4 +1077,4 @@ window.addEventListener('DOMContentLoaded', ()=>{
 
 if __name__ == "__main__":
     # For local dev
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)
