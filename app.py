@@ -714,6 +714,7 @@ def write_template_files_if_missing():
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <script defer src="{{ url_for('static', filename='app.js') }}"></script>
 </head>
 <body class="page">
@@ -897,7 +898,6 @@ def write_basic_static_if_missing():
     (STATIC_DIR / "app.css").write_text("""
 :root { --bg:#0b0f14; --card:#141a22; --text:#e8eef7; --muted:#9fb0c6; --accent:#6aa6ff; --danger:#ff6a6a; }
 *{box-sizing:border-box} body.page{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,Segoe UI,Roboto,Arial}
-.topbar{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #1f2835;background:#0e131a}
 .brand{color:var(--text);text-decoration:none;font-weight:700}
 .nav a{color:var(--muted);margin-left:14px;text-decoration:none}
 .container{max-width:1100px;margin:20px auto;padding:0 16px}
@@ -965,5 +965,6 @@ window.addEventListener('DOMContentLoaded', ()=>{
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
