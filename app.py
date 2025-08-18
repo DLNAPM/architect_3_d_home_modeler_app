@@ -893,152 +893,97 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
 
-import os
-
 def write_basic_static_if_missing():
-    """Ensure basic static files exist for CSS/JS on first run."""
-    os.makedirs("static", exist_ok=True)
+    """Create minimal static assets safely (no raw CSS in Python)."""
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
-    # ---------------- CSS ----------------
-    css_path = os.path.join("static", "style.css")
-    if not os.path.exists(css_path):
-        css_content = """/* Default stylesheet for Architect 3D Home Modeler */
+    # -------- CSS (app.css) --------
+    css_path = STATIC_DIR / "app.css"
+    if not css_path.exists():
+        css_lines = [
+            "/* Default stylesheet for Architect 3D Home Modeler */",
+            "body{margin:0;background:#0b0f14;color:#e8eef7;font-family:system-ui,Segoe UI,Roboto,Arial}",
+            ".topbar{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #1f2835;background:#0e131a}",
+            ".brand{color:#e8eef7;text-decoration:none;font-weight:700}",
+            ".nav a{color:#9fb0c6;margin-left:14px;text-decoration:none}",
+            ".container{max-width:1100px;margin:20px auto;padding:0 16px}",
+            ".card{background:#141a22;border:1px solid #1f2835;padding:16px;border-radius:10px;margin-bottom:16px}",
+            ".row{display:flex;align-items:center}.space{justify-content:space-between}.gap>*{margin-right:8px}",
+            ".file input{display:none}.file span{border:1px dashed #2a3546;padding:10px;border-radius:6px;cursor:pointer}",
+            ".primary{background:#6aa6ff;color:#06101e;border:0;padding:10px 14px;border-radius:8px;cursor:pointer}",
+            ".button{background:#2a3546;color:#e8eef7;padding:8px 12px;border-radius:8px;text-decoration:none}",
+            ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}",
+            ".render-card{position:relative;background:#0e141b;border:1px solid #1d2533;border-radius:12px;padding:10px}",
+            ".render-card.selectable{cursor:pointer}",
+            ".render-card input[type=checkbox]{position:absolute;top:8px;left:8px;transform:scale(1.2)}",
+            ".render-img{width:100%;height:auto;border-radius:8px;display:block;transition:filter .2s ease;cursor:pointer}",
+            ".render-img.dark{filter:brightness(.7) contrast(1.1)}",
+            ".dark-toggle{margin-top:8px;background:#223047;color:#cfe3ff;border:0;padding:6px 8px;border-radius:6px;cursor:pointer}",
+            ".meta{margin-top:6px}.tag{font-size:12px;color:#c5d3e9;background:#212c3b;padding:3px 6px;border-radius:999px;margin-right:6px}",
+            ".tag.like{background:#1d3c2a;color:#9ef2b0}.tag.fav{background:#3a2a4a;color:#e3b8ff}",
+            ".flashes .flash{padding:10px;margin:8px 0;border-radius:8px}",
+            ".flash.success{background:#14301d;color:#9ef2b0}.flash.warning{background:#332c17;color:#ffe28a}",
+            ".flash.info{background:#173246;color:#a5d9ff}.flash.danger{background:#351b1b;color:#ffb6b6}",
+            ".pill-list{list-style:none;padding:0;display:flex;flex-wrap:wrap}",
+            ".pill-list li{padding:6px 10px;background:#202b3a;border:1px solid #2a3546;margin:6px;border-radius:999px}",
+            ".options-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;margin-top:12px}",
+            ".opt label{display:block;font-size:13px;margin-bottom:6px;color:#cfe3ff}",
+            ".opt select, textarea, input[type=text], input[type=email], input[type=password], select{width:100%;padding:8px;border:1px solid #2a3546;border-radius:6px;background:#0c1219;color:#dbe6f6}",
+            ".footer{padding:24px;text-align:center;color:#88a2c2}",
+            "h1,h2{margin-top:0}",
 
-body {
-  font-family: Arial, sans-serif;
-  margin: 0;
-  padding: 0;
-  background: #f8f9fa;
-  color: #222;
-}
+            /* Modal (fullscreen image) */
+            ".modal{display:none;position:fixed;z-index:2000;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,.9)}",
+            ".modal-content{display:block;max-width:95%;max-height:95%;margin:auto;border-radius:8px}",
+            ".close{position:absolute;top:16px;right:24px;font-size:36px;color:#fff;cursor:pointer}",
+            ".voice-box{position:relative;display:flex;gap:8px;align-items:stretch}",
+            ".voice-btn{background:#223047;color:#cfe3ff;border:0;border-radius:6px;padding:0 10px;cursor:pointer}",
+        ]
+        css_path.write_text("\n".join(css_lines), encoding="utf-8")
 
-.topbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 12px 16px;
-  border-bottom: 1px solid #1f2835;
-  background: #0e131a;
-  color: white;
-}
+    # -------- JS (app.js) --------
+    js_path = STATIC_DIR / "app.js"
+    if not js_path.exists():
+        js_lines = [
+            "// Default JS for Architect 3D Home Modeler",
 
-.btn {
-  padding: 8px 12px;
-  cursor: pointer;
-  border: none;
-  border-radius: 4px;
-  background: #1f6feb;
-  color: white;
-}
+            "// Fullscreen modal image viewer",
+            "document.addEventListener('click', function(e){",
+            "  const img = e.target.closest('.render-img');",
+            "  if(!img) return;",
+            "  const modal = document.getElementById('imageModal');",
+            "  const modalImg = document.getElementById('modalImg');",
+            "  const caption = document.getElementById('caption');",
+            "  if(modal && modalImg){",
+            "    modal.style.display = 'block';",
+            "    modalImg.src = img.src;",
+            "    if(caption) caption.textContent = img.alt || '';",
+            "  }",
+            "});",
+            "window.closeModal = function(){",
+            "  const modal = document.getElementById('imageModal');",
+            "  if(modal) modal.style.display = 'none';",
+            "};",
 
-.btn:hover {
-  background: #1558b0;
-}
+            "// Voice input for Describe Changes",
+            "window.startVoice = function(id){",
+            "  if(!('webkitSpeechRecognition' in window)){",
+            "    alert('Voice recognition not supported in this browser.');",
+            "    return;",
+            "  }",
+            "  const rec = new webkitSpeechRecognition();",
+            "  rec.continuous = false; rec.interimResults = false; rec.lang = 'en-US';",
+            "  rec.start();",
+            "  rec.onresult = function(e){",
+            "    const txt = Array.from(e.results).map(r=>r[0].transcript).join(' ');",
+            "    const area = document.getElementById('desc-' + id);",
+            "    if(area) area.value = txt;",
+            "  };",
+            "};",
+        ]
+        js_path.write_text("\n".join(js_lines), encoding="utf-8")
 
-.gallery {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 20px;
-}
-
-.render-card {
-  border: 1px solid #ddd;
-  padding: 10px;
-  width: 300px;
-  background: #fff;
-}
-
-.render-img {
-  width: 100%;
-  cursor: pointer;
-}
-
-.modal {
-  display: none;
-  position: fixed;
-  z-index: 2000;
-  left: 0; top: 0;
-  width: 100%; height: 100%;
-  background: rgba(0,0,0,0.9);
-}
-
-.modal-content {
-  display: block;
-  max-width: 95%;
-  max-height: 95%;
-  margin: auto;
-}
-
-.close {
-  position: absolute;
-  top: 20px;
-  right: 30px;
-  font-size: 40px;
-  color: #fff;
-  cursor: pointer;
-}
-"""
-        with open(css_path, "w") as f:
-            f.write(css_content)
-
-    # ---------------- JS ----------------
-    js_path = os.path.join("static", "app.js")
-    if not os.path.exists(js_path):
-        js_content = """// Default JavaScript for Architect 3D Home Modeler
-
-// Fullscreen modal image viewer
-function enlargeImage(img) {
-  const modal = document.getElementById("imageModal");
-  const modalImg = document.getElementById("modalImg");
-  modal.style.display = "block";
-  modalImg.src = img.src;
-}
-function closeModal() {
-  document.getElementById("imageModal").style.display = "none";
-}
-
-// Voice input for "Describe Changes"
-function startVoice(id) {
-  if (!('webkitSpeechRecognition' in window)) {
-    alert("Voice recognition not supported in this browser.");
-    return;
-  }
-  const recognition = new webkitSpeechRecognition();
-  recognition.lang = "en-US";
-  recognition.start();
-
-  recognition.onresult = function(event) {
-    const text = event.results[0][0].transcript;
-    document.getElementById("desc-" + id).value = text;
-  };
-}
-"""
-        with open(js_path, "w") as f:
-            f.write(js_content)
-
-
-    # JS (voice input + small helpers)
-    (STATIC_DIR / "app.js").write_text("""
-window.addEventListener('DOMContentLoaded', ()=>{
-  const voiceBtn = document.getElementById('voiceBtn');
-  if (voiceBtn && 'webkitSpeechRecognition' in window) {
-    const rec = new webkitSpeechRecognition();
-    rec.continuous = false; rec.interimResults = false; rec.lang = 'en-US';
-    const area = document.getElementById('description');
-    voiceBtn.addEventListener('click', ()=>{
-      try{ rec.start(); }catch(e){}
-    });
-    rec.onresult = (e)=>{
-      const txt = Array.from(e.results).map(r=>r[0].transcript).join(' ');
-      if (area) area.value = (area.value? area.value + ' ' : '') + txt;
-    };
-  } else if (voiceBtn) {
-    voiceBtn.disabled = true; voiceBtn.title = 'Voice input not supported in this browser';
-  }
-});
-""", encoding="utf-8")
-
-    # Favicon placeholder
+    # -------- Favicon (if missing) --------
     from PIL import Image, ImageDraw
     ico = STATIC_DIR / "favicon.ico"
     if not ico.exists():
@@ -1048,11 +993,13 @@ window.addEventListener('DOMContentLoaded', ()=>{
         d.text((16,22), "A3", fill=(200,220,255,255))
         img.save(ico, format="ICO")
 
+
 # ---------- Main ----------
 
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
