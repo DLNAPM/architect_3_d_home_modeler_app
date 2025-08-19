@@ -837,7 +837,7 @@ def write_template_files_if_missing():
   document.getElementById("closeModal").onclick=()=>modal.style.display="none";
 </script>
 {% endblock %}
-
+""", encoding="utf-8")
 
     # slideshow.html
     (TEMPLATES_DIR / "slideshow.html").write_text("""{% extends "layout.html" %}{% block content %}
@@ -981,3 +981,4 @@ def write_basic_static_if_missing():
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
