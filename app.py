@@ -127,10 +127,10 @@ def save_rendering(category: str, subcategory: str, image_path: str, description
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO renderings (category, subcategory, image_path, liked, favorited, created_at)
-        VALUES (?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
+        INSERT INTO renderings (category, subcategory, image_path, prompt, liked, favorited, created_at)
+        VALUES (?, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
         """,
-        (category, subcategory, image_path),
+        (category, subcategory, image_path, description),
     )
     conn.commit()
     conn.close()
@@ -1043,6 +1043,7 @@ def write_basic_static_if_missing():
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
