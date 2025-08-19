@@ -432,18 +432,18 @@ def generate():
     # ✅ Redirect so they always appear in gallery
     return redirect(url_for("gallery"))
 
-@app.post("/generate")
-def generate():
-    """Generate Front & Back exteriors immediately, then show rooms."""
-    description = request.form.get("description", "").strip()
-    plan_file = request.files.get("plan_file")
-    plan_uploaded = False
+# @app.post("/generate")
+# def generate():
+#     """Generate Front & Back exteriors immediately, then show rooms."""
+#     description = request.form.get("description", "").strip()
+#     plan_file = request.files.get("plan_file")
+#     plan_uploaded = False
 
-    if plan_file and plan_file.filename:
-        plan_uploaded = True
-        safe_name = f"{uuid.uuid4().hex}_{plan_file.filename}"
-        plan_path = UPLOAD_DIR / safe_name
-        plan_file.save(plan_path)
+#     if plan_file and plan_file.filename:
+#         plan_uploaded = True
+#         safe_name = f"{uuid.uuid4().hex}_{plan_file.filename}"
+#         plan_path = UPLOAD_DIR / safe_name
+#         plan_file.save(plan_path)
 
     # FRONT & BACK prompts
     front_prompt = build_prompt("Front Exterior", OPTIONS["Front Exterior"], description, plan_uploaded)
@@ -1000,6 +1000,7 @@ def write_basic_static_if_missing():
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
