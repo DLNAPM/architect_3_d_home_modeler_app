@@ -10,14 +10,12 @@ Architect 3D Home Modeler – Flask 3.x single-file app
 - Dark mode toggle per rendering (CSS filter)
 - @app.before_request + guard for one-time init (Flask 3.x safe)
 - Auto-scaffold templates/ and static/ on first run
-# ---------Recent Updates 08222025 -----------
+# ---------Recent Updates 08222025 v4 -----------
+- AGGRESSIVE PROMPT RE-ENGINEERING: Prompts are now framed as commands to the AI for maximum realism and context-awareness.
+- Front exteriors are now strictly commanded to include driveways/garages and exclude all backyard elements.
+- Switched to "hd" quality and "vivid" style in API call to further enhance photorealism.
 - ADDED: Logic to prevent swimming pools in Front Exterior renderings.
 - ADDED: Basement rooms now only appear if "basement" is in the initial description.
-- ADDED: A "Please hold" loading overlay when generating initial exteriors.
-- ENABLED: The night/dark mode toggle button on all renderings is now functional.
-- FIXED: Corrected layout for newly generated exteriors to prevent stacking.
-- FIXED: Restored the dynamic options for the "Generate a New Room" feature.
-- ADDED: Implemented a slideshow for guest/session renderings.
 """
 
 import os
@@ -300,21 +298,28 @@ def build_room_list(description: str):
     return rooms
 
 def build_prompt(subcategory: str, options_map: dict, description: str, plan_uploaded: bool):
-    """Builds the final prompt for the AI, enforcing specific rules."""
-    selections = ", ".join([f"{k}: {v}" for k, v in options_map.items() if v and v not in ["None", ""]])
-    plan_hint = "Consider the uploaded architectural plan as a guide. " if plan_uploaded else ""
+    """Builds a highly detailed and context-aware prompt for the AI."""
     
-    # --- RULE --- If it's a Front Exterior, remove any mention of pools.
+    realism_command = "Create an ultra-realistic architectural photograph, not a 3D model rendering. Emulate a shot taken on a high-end DSLR camera (Canon EOS 5D) with a 35mm prime lens. The lighting should be soft, natural, and cinematic (golden hour lighting). Focus on photorealistic textures: the grain of the wood, the texture of brick, the reflection on glass."
+    selections = ", ".join([f"{k}: {v}" for k, v in options_map.items() if v and v not in ["None", ""]])
+    plan_hint = "Use the uploaded architectural plan as a strict guide. " if plan_uploaded else ""
+    
+    view_context = ""
     if subcategory == "Front Exterior":
+        view_context = "The camera angle MUST be from the street, looking towards the house. The composition MUST include the driveway leading to the garage, the main walkway, and the front door. CRITICAL EXCLUSIONS for Front Exterior: Absolutely NO backyard items. This means NO swimming pools, NO large patios with lounge chairs, NO paradise grills, NO pool houses. The scene must be a front yard ONLY."
         description = re.sub(r'swimming pool|pool', '', description, flags=re.IGNORECASE)
-        selections = ", ".join([s for s in selections.split(", ") if "pool" not in s.lower()])
+    elif subcategory == "Back Exterior":
+        view_context = "The camera angle MUST be from the backyard, looking towards the rear of the house. Focus on outdoor living areas like patios, decks, or pools."
+    else:
+        view_context = f"Interior photograph of the {subcategory}."
 
-    base = (f"High-quality photorealistic {subcategory} rendering for a residential home. "
+    base = (f"{realism_command} The subject is a residential {subcategory}. {view_context} "
             f"{plan_hint}"
-            f"Design intent: {description.strip() or 'Client unspecified style; pick tasteful contemporary.'} "
-            f"Apply choices -> {selections or 'designer’s choice with cohesive style'}. "
-            f"Balanced composition, realistic lighting, 4k detail, magazine quality.")
+            f"The client's design intent: '{description.strip() or 'A tasteful contemporary style.'}' "
+            f"Apply these specific choices: {selections or 'designer’s choice with a cohesive style'}. "
+            f"Ensure balanced composition and magazine quality. The final image must look like a real photo.")
     return base
+
 
 def save_image_bytes(png_bytes: bytes) -> str:
     uid = uuid.uuid4().hex
@@ -326,7 +331,7 @@ def generate_image_via_openai(prompt: str) -> str:
     if openai_client is None or not OPENAI_API_KEY:
         raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY.")
     try:
-        result = openai_client.images.generate(model="dall-e-3", prompt=prompt, size="1024x1024", quality="standard", response_format="b64_json", n=1)
+        result = openai_client.images.generate(model="dall-e-3", prompt=prompt, size="1024x1024", quality="hd", style="vivid", response_format="b64_json", n=1)
         b64 = result.data[0].b64_json
         if not b64: raise RuntimeError("No image data returned from OpenAI.")
         return save_image_bytes(base64.b64decode(b64))
@@ -352,7 +357,6 @@ def generate():
     if plan_uploaded:
         (UPLOAD_DIR / f"{uuid.uuid4().hex}_{plan_file.filename}").write_bytes(plan_file.read())
 
-    # --- LOGIC --- Determine and save the available rooms based on the description
     session['available_rooms'] = build_room_list(description)
 
     user_id = session.get("user_id")
@@ -557,7 +561,6 @@ def logout():
 
 # ---------- Scaffolding and Main Execution ----------
 def write_template_files_if_missing():
-    # layout.html
     (TEMPLATES_DIR / "layout.html").write_text("""<!doctype html>
 <html lang="en">
 <head>
@@ -611,7 +614,6 @@ def write_template_files_if_missing():
 </html>
 """, encoding="utf-8")
 
-    # index.html
     (TEMPLATES_DIR / "index.html").write_text("""{% extends "layout.html" %}{% block content %}
 <div class="landing-content">
   <h1>Design Your Dream Home with AI</h1>
@@ -647,7 +649,6 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
     
-    # gallery.html
     (TEMPLATES_DIR / "gallery.html").write_text("""{% extends "layout.html" %}
 {% from "macros.html" import render_card %}
 {% block content %}
@@ -692,7 +693,6 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
 
-    # session_gallery.html
     (TEMPLATES_DIR / "session_gallery.html").write_text("""{% extends "layout.html" %}
 {% from "macros.html" import render_card %}
 {% block content %}
@@ -733,7 +733,6 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
 
-    # slideshow.html
     (TEMPLATES_DIR / "slideshow.html").write_text("""{% extends "layout.html" %}
 {% block content %}
 <div class="slideshow-container">
@@ -767,7 +766,6 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
 
-    # macros.html
     (TEMPLATES_DIR / "macros.html").write_text("""
 {% macro render_card(r, options, user) %}
 <div class="render-card" data-id="{{ r['id'] }}">
