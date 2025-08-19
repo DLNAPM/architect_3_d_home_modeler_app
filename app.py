@@ -694,6 +694,26 @@ def login():
         return redirect(url_for("login"))
     return render_template("login.html", app_name=APP_NAME, user=current_user())
 
+@app.route("/generate", methods=["POST"])
+def generate():
+    desc = request.form.get("description") or ""
+    file = request.files.get("file")
+
+    # Decide what rooms to include
+    rooms = determine_rooms(desc, file)
+
+    # Generate 2 exterior renderings (Front & Back)
+    for subcat in ["Front Exterior", "Back Exterior"]:
+        prompt = f"{desc}, {subcat}"
+        image_path = generate_image_via_openai(prompt)
+        save_rendering("Exterior", subcat, image_path, desc)
+
+    flash("Generated Front & Back exterior renderings!", "success")
+
+    # ✅ Redirect so they always appear in gallery
+    return redirect(url_for("gallery"))
+
+
 @app.get("/logout")
 def logout():
     session.clear()
@@ -983,6 +1003,7 @@ def write_basic_static_if_missing():
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
