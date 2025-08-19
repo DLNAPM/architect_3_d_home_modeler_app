@@ -370,6 +370,8 @@ def generate_image_via_openai(prompt: str) -> str:
         )
         b64 = result.data[0].b64_json
         png_bytes = base64.b64decode(b64)
+        if not result.data or not result.data[0].b64_json:
+    raise RuntimeError("No image data returned from OpenAI.")
         return save_image_bytes(png_bytes)
     except Exception as e:
         raise RuntimeError(f"OpenAI image generation failed: {e}")
@@ -981,4 +983,5 @@ def write_basic_static_if_missing():
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
