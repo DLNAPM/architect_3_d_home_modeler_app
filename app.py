@@ -51,7 +51,6 @@ from PIL import Image
 from email.message import EmailMessage
 import smtplib
 
-
 # ---------- Config ----------
 APP_NAME = "Architect 3D Home Modeler"
 BASE_DIR = Path(__file__).resolve().parent
@@ -93,48 +92,6 @@ except Exception as e:
     print("OpenAI SDK not available yet:", e)
 
 # ---------- Helpers ----------
-
-def determine_rooms(description: str, file=None):
-    """
-    Decide what room categories to include based on user description or uploaded plan.
-    Always includes the core rooms, and if 'basement' is mentioned, include basement-specific rooms.
-    """
-    rooms = [
-        "Living Room",
-        "Kitchen",
-        "Home Office",
-        "Family Room",
-        "Primary Bedroom",
-        "Primary Bathroom",
-        "Bedroom2",
-        "Bedroom3",
-    ]
-
-    # If user mentions basement, add extra spaces
-    desc_lower = description.lower()
-    if "basement" in desc_lower:
-        rooms.extend([
-            "Basement w/ Bar",
-            "Theater Room",
-            "Exercise Room",
-            "Steam Room",
-        ])
-
-    return rooms
-
-def save_rendering(category: str, subcategory: str, image_path: str, description: str):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO renderings (category, subcategory, image_path, prompt, liked, favorited, created_at)
-        VALUES (?, ?, ?, ?, 0, 0, CURRENT_TIMESTAMP)
-        """,
-        (category, subcategory, image_path, description),
-    )
-    conn.commit()
-    conn.close()
-
 
 def init_fs_once():
     """Make sure folders & templates exist once."""
@@ -397,27 +354,29 @@ def save_image_bytes(png_bytes: bytes) -> str:
 def generate_image_via_openai(prompt: str) -> str:
     """
     Calls OpenAI Images API and returns relative image path under static/.
-    Uses 'gpt-image-1' (available in the 2024+ SDK). If unavailable locally,
-    raises an informative error.
+    Uses 'dall-e-3' by default.
     """
     if openai_client is None or not OPENAI_API_KEY:
         raise RuntimeError("OpenAI client not configured. Set OPENAI_API_KEY.")
     try:
-        # Generate an image (1024x1024)
+        # Generate an image (1024x1024) using DALL-E 3
         result = openai_client.images.generate(
-            model="gpt-image-1",
+            model="dall-e-3",
             prompt=prompt,
             size="1024x1024",
-            quality="high",
+            quality="standard", # Standard is fine for web use, HD is also an option
+            response_format="b64_json",
             n=1,
         )
         b64 = result.data[0].b64_json
-        png_bytes = base64.b64decode(b64)
-        if not result.data or not result.data[0].b64_json:
+        if not b64:
             raise RuntimeError("No image data returned from OpenAI.")
+        
+        png_bytes = base64.b64decode(b64)
         return save_image_bytes(png_bytes)
     except Exception as e:
         raise RuntimeError(f"OpenAI image generation failed: {e}")
+
 
 def ensure_user_dir(uid: int):
     (RENDER_DIR / f"user_{uid}").mkdir(parents=True, exist_ok=True)
@@ -456,41 +415,23 @@ def index():
                            options=OPTIONS,
                            basic_rooms=BASIC_ROOMS)
 
-@app.route("/generate", methods=["POST"])
+@app.post("/generate")
+@login_required
 def generate():
-    desc = request.form.get("description") or ""
-    file = request.files.get("file")
+    """Generate Front & Back exteriors immediately, then show rooms."""
+    description = request.form.get("description", "").strip()
+    plan_file = request.files.get("plan_file")
+    plan_uploaded = False
 
-    # Decide what rooms to include
-    rooms = determine_rooms(desc, file)
-
-    # Generate 2 exterior renderings (Front & Back)
-    for subcat in ["Front Exterior", "Back Exterior"]:
-        prompt = f"{desc}, {subcat}"
-        image_path = generate_image_via_openai(prompt)
-        save_rendering("Exterior", subcat, image_path, desc)
-
-    flash("Generated Front & Back exterior renderings!", "success")
-
-    # ✅ Redirect so they always appear in gallery
-    return redirect(url_for("gallery"))
-
-# @app.post("/generate")
-# def generate():
-#     """Generate Front & Back exteriors immediately, then show rooms."""
-#     description = request.form.get("description", "").strip()
-#     plan_file = request.files.get("plan_file")
-#     plan_uploaded = False
-
-#     if plan_file and plan_file.filename:
-#         plan_uploaded = True
-#         safe_name = f"{uuid.uuid4().hex}_{plan_file.filename}"
-#         plan_path = UPLOAD_DIR / safe_name
-#         plan_file.save(plan_path)
+    if plan_file and plan_file.filename:
+        plan_uploaded = True
+        safe_name = f"{uuid.uuid4().hex}_{plan_file.filename}"
+        plan_path = UPLOAD_DIR / safe_name
+        plan_file.save(plan_path)
 
     # FRONT & BACK prompts
-    front_prompt = build_prompt("Front Exterior", OPTIONS["Front Exterior"], description, plan_uploaded)
-    back_prompt  = build_prompt("Back Exterior",  OPTIONS["Back Exterior"],  description, plan_uploaded)
+    front_prompt = build_prompt("Front Exterior", {}, description, plan_uploaded)
+    back_prompt  = build_prompt("Back Exterior",  {},  description, plan_uploaded)
 
     paths = []
     for subcat, prompt in [("Front Exterior", front_prompt), ("Back Exterior", back_prompt)]:
@@ -514,24 +455,18 @@ def generate():
     conn.commit()
     conn.close()
 
-    rooms = build_room_list(description)
     flash("Generated Front & Back exterior renderings!", "success")
-    # Pass options so gallery template JS always has it
-    return render_template("gallery.html",
-                           app_name=APP_NAME,
-                           user=current_user(),
-                           new_images=[{"subcategory": s, "path": p} for s, p, _ in paths],
-                           rooms=rooms,
-                           options=OPTIONS)
+    return redirect(url_for("gallery"))
+
 
 @app.post("/generate_room")
+@login_required
 def generate_room():
     """Generate a room rendering from dropdown options."""
-    subcategory = request.form.get("subcategory")  # e.g., "Living Room"
+    subcategory = request.form.get("subcategory")
     description = request.form.get("description", "")
-    plan_uploaded = request.form.get("plan_uploaded") == "1"  # from hidden field if needed
+    plan_uploaded = request.form.get("plan_uploaded") == "1"
 
-    # Collect selected room options
     selected = {}
     if subcategory in OPTIONS:
         for opt_name in OPTIONS[subcategory].keys():
@@ -541,8 +476,7 @@ def generate_room():
     try:
         rel_path = generate_image_via_openai(prompt)
     except Exception as e:
-        flash(str(e), "danger")
-        return redirect(url_for("index"))
+        return jsonify({"error": str(e)}), 500
 
     user_id = session.get("user_id")
     conn = get_db()
@@ -553,78 +487,94 @@ def generate_room():
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (user_id, "ROOM", subcategory, json.dumps(selected), prompt, rel_path, now))
     conn.commit()
+    new_id = cur.lastrowid
     conn.close()
-
-    flash(f"Generated {subcategory} rendering!", "success")
-    return redirect(url_for("gallery"))
+    
+    return jsonify({
+        "id": new_id,
+        "path": url_for('static', filename=rel_path),
+        "subcategory": subcategory,
+        "message": f"Generated {subcategory} rendering!"
+    })
 
 @app.get("/gallery")
+@login_required
 def gallery():
     user = current_user()
     conn = get_db()
     cur = conn.cursor()
-    # show all (or user-scoped if logged in)
-    if user:
-        cur.execute("""SELECT * FROM renderings WHERE user_id IS NULL OR user_id = ? ORDER BY created_at DESC""", (user["id"],))
-    else:
-        cur.execute("""SELECT * FROM renderings ORDER BY created_at DESC""")
+    cur.execute("""SELECT * FROM renderings WHERE user_id = ? ORDER BY created_at DESC""", (user["id"],))
     items = [dict(row) for row in cur.fetchall()]
     conn.close()
 
+    # Determine which rooms to show for generation
+    # This might need a better way to get the original description
+    all_rooms = build_room_list("") # Assuming no basement by default on gallery load
+    
     fav_count = sum(1 for r in items if r["favorited"])
-    return redirect(url_for("gallery"))
+    return render_template("gallery.html",
+                           app_name=APP_NAME, user=user, items=items,
+                           show_slideshow=(fav_count >= 2),
+                           rooms=all_rooms,
+                           options=OPTIONS)
 
 @app.post("/bulk_action")
+@login_required
 def bulk_action():
-    """Handle multi-select actions: like, favorite, delete, email, download list."""
     action = request.form.get("action")
-    ids = request.form.getlist("rendering_ids")
-    if not ids:
-        flash("No renderings selected.", "warning")
-        return redirect(url_for("gallery"))
-
+    ids_str = request.form.get("ids")
+    if not ids_str:
+        return jsonify({"error": "No renderings selected."}), 400
+    ids = json.loads(ids_str)
+    
     conn = get_db()
     cur = conn.cursor()
+    user_id = session["user_id"]
 
     if action == "delete":
         q_marks = ",".join("?" for _ in ids)
-        cur.execute(f"SELECT image_path FROM renderings WHERE id IN ({q_marks})", ids)
+        cur.execute(f"SELECT image_path FROM renderings WHERE id IN ({q_marks}) AND user_id = ?", (*ids, user_id))
         paths = [row["image_path"] for row in cur.fetchall()]
         for rel in paths:
             try:
-                os.remove(STATIC_DIR / rel)
-            except Exception:
-                pass
-        cur.execute(f"DELETE FROM renderings WHERE id IN ({q_marks})", ids)
+                (STATIC_DIR / rel).unlink(missing_ok=True)
+            except Exception as e:
+                print(f"Error deleting file: {e}")
+        cur.execute(f"DELETE FROM renderings WHERE id IN ({q_marks}) AND user_id = ?", (*ids, user_id))
         conn.commit()
         conn.close()
-        flash(f"Deleted {len(ids)} rendering(s).", "success")
+        return jsonify({"message": f"Deleted {len(ids)} rendering(s)."}), 200
 
-    elif action in ("like", "unlike", "favorite", "unfavorite"):
-        val = 1 if action in ("like", "favorite") else 0
-        field = "liked" if "like" in action else "favorited"
+    elif action in ("like", "favorite"):
+        field = "liked" if action == "like" else "favorited"
         q_marks = ",".join("?" for _ in ids)
-        cur.execute(f"UPDATE renderings SET {field} = ? WHERE id IN ({q_marks})", (val, *ids))
+        cur.execute(f"SELECT id, {field} FROM renderings WHERE id IN ({q_marks}) AND user_id = ?", (*ids, user_id))
+        rows = cur.fetchall()
+        # Toggle the value
+        updates = []
+        for row in rows:
+            new_val = 1 - row[field]
+            updates.append((new_val, row['id']))
+        
+        cur.executemany(f"UPDATE renderings SET {field} = ? WHERE id = ?", updates)
         conn.commit()
         conn.close()
-        verb = "Liked" if field == "liked" and val else "Unliked" if field == "liked" else "Favorited" if val else "Unfavorited"
-        flash(f"{verb} {len(ids)} rendering(s).", "success")
+        return jsonify({"message": f"Updated {len(ids)} rendering(s)."}), 200
 
     elif action == "email":
         to_email = request.form.get("to_email")
         if not to_email:
             conn.close()
-            flash("Please provide a destination email.", "warning")
-            return redirect(url_for("gallery"))
-        # Only send liked renderings
+            return jsonify({"error": "Please provide a destination email."}), 400
+
         q_marks = ",".join("?" for _ in ids)
-        cur.execute(f"SELECT image_path, liked FROM renderings WHERE id IN ({q_marks})", ids)
+        cur.execute(f"SELECT image_path, liked FROM renderings WHERE id IN ({q_marks}) AND user_id = ?", (*ids, user_id))
         rows = cur.fetchall()
         send_paths = [r["image_path"] for r in rows if r["liked"]]
         conn.close()
+
         if not send_paths:
-            flash("Only 'Liked' renderings can be emailed. None selected were liked.", "warning")
-            return redirect(url_for("gallery"))
+            return jsonify({"error": "Only 'Liked' renderings can be emailed. None of the selected were liked."}), 400
         try:
             send_email_with_images(
                 to_email,
@@ -632,30 +582,33 @@ def bulk_action():
                 body="Here are the renderings you requested.",
                 image_paths=send_paths
             )
-            flash(f"Emailed {len(send_paths)} rendering(s) to {to_email}.", "success")
+            return jsonify({"message": f"Emailed {len(send_paths)} rendering(s) to {to_email}."}), 200
         except Exception as e:
-            flash(f"Email failed: {e}", "danger")
+            return jsonify({"error": f"Email failed: {e}"}), 500
 
     elif action == "download":
-        # Return a JSON list of static URLs to download individually (UI handles)
         q_marks = ",".join("?" for _ in ids)
-        cur.execute(f"SELECT id, image_path FROM renderings WHERE id IN ({q_marks})", ids)
+        cur.execute(f"SELECT image_path, liked FROM renderings WHERE id IN ({q_marks}) AND user_id=?", (*ids, user_id))
         rows = cur.fetchall()
         conn.close()
-        urls = [url_for("static", filename=row["image_path"], _external=False) for row in rows]
+        liked_paths = [r["image_path"] for r in rows if r["liked"]]
+        if not liked_paths:
+            return jsonify({"error": "Only 'Liked' renderings can be downloaded."}), 400
+        urls = [url_for("static", filename=p) for p in liked_paths]
         return jsonify({"download_urls": urls})
 
     else:
         conn.close()
-        flash("Unknown action.", "danger")
+        return jsonify({"error": "Unknown action."}), 400
 
-    return redirect(url_for("gallery"))
 
 @app.get("/slideshow")
+@login_required
 def slideshow():
+    user_id = session["user_id"]
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM renderings WHERE favorited = 1 ORDER BY created_at DESC")
+    cur.execute("SELECT * FROM renderings WHERE favorited = 1 AND user_id = ? ORDER BY created_at DESC", (user_id,))
     items = [dict(r) for r in cur.fetchall()]
     conn.close()
     if len(items) < 2:
@@ -663,34 +616,33 @@ def slideshow():
         return redirect(url_for("gallery"))
     return render_template("slideshow.html", app_name=APP_NAME, user=current_user(), items=items)
 
-# --- new endpoint to modify an existing rendering ---
-@app.post("/modify_rendering")
-def modify_rendering():
+@app.post("/modify_rendering/<int:rid>")
+@login_required
+def modify_rendering(rid):
     """Take an existing rendering, apply new description/options, regenerate."""
-    rid = request.form.get("rendering_id")
     description = request.form.get("description", "")
     conn = get_db()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM renderings WHERE id=?", (rid,))
+    cur.execute("SELECT * FROM renderings WHERE id=? AND user_id=?", (rid, session["user_id"]))
     row = cur.fetchone()
     if not row:
         conn.close()
-        flash("Rendering not found.", "danger")
-        return redirect(url_for("gallery"))
+        return jsonify({"error": "Rendering not found."}), 404
 
     subcategory = row["subcategory"]
-    # collect updated options
+    original_options = json.loads(row["options_json"] or "{}")
+    
     selected = {}
     if subcategory in OPTIONS:
         for opt_name in OPTIONS[subcategory].keys():
-            selected[opt_name] = request.form.get(opt_name) or json.loads(row["options_json"]).get(opt_name)
+            # Use new value from form, or fall back to original, or None
+            selected[opt_name] = request.form.get(opt_name) or original_options.get(opt_name)
 
     prompt = build_prompt(subcategory, selected, description, False)
     try:
         rel_path = generate_image_via_openai(prompt)
     except Exception as e:
-        flash(f"Modification failed: {e}", "danger")
-        return redirect(url_for("gallery"))
+        return jsonify({"error": f"Modification failed: {e}"}), 500
 
     now = datetime.utcnow().isoformat()
     cur.execute("""
@@ -698,10 +650,15 @@ def modify_rendering():
         VALUES (?, ?, ?, ?, ?, ?, ?)
     """, (row["user_id"], row["category"], subcategory, json.dumps(selected), prompt, rel_path, now))
     conn.commit()
+    new_id = cur.lastrowid
     conn.close()
-    flash(f"Modified {subcategory} rendering!", "success")
-    return redirect(url_for("gallery"))
-
+    
+    return jsonify({
+        "id": new_id,
+        "path": url_for('static', filename=rel_path),
+        "subcategory": subcategory,
+        "message": f"Modified {subcategory} rendering!"
+    })
 
 # ---------- Auth ----------
 
@@ -730,7 +687,7 @@ def register():
         session["user_id"] = user_id
         session["user_email"] = email
         flash("Welcome! Account created.", "success")
-        return redirect(url_for("index"))
+        return redirect(url_for("gallery"))
     return render_template("register.html", app_name=APP_NAME, user=current_user())
 
 @app.route("/login", methods=["GET", "POST"])
@@ -748,11 +705,10 @@ def login():
             session["user_email"] = user["email"]
             flash("Logged in successfully.", "success")
             nxt = request.args.get("next")
-            return redirect(nxt or url_for("index"))
+            return redirect(nxt or url_for("gallery"))
         flash("Invalid credentials.", "danger")
         return redirect(url_for("login"))
     return render_template("login.html", app_name=APP_NAME, user=current_user())
-
 
 @app.get("/logout")
 def logout():
@@ -770,21 +726,19 @@ def favicon():
 def write_template_files_if_missing():
     # layout.html
     (TEMPLATES_DIR / "layout.html").write_text("""<!doctype html>
-<html lang="en" data-theme="light">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ app_name }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
-  <script defer src="{{ url_for('static', filename='app.js') }}"></script>
 </head>
 <body class="page">
   <header class="topbar">
     <a class="brand" href="{{ url_for('index') }}">{{ app_name }}</a>
     <nav class="nav">
-      <a href="{{ url_for('gallery') }}">Gallery</a>
       {% if user %}
+        <a href="{{ url_for('gallery') }}">My Gallery</a>
         <span class="user">Hi {{ user['name'] or user['email'] }}</span>
         <a href="{{ url_for('logout') }}">Logout</a>
       {% else %}
@@ -794,126 +748,155 @@ def write_template_files_if_missing():
     </nav>
   </header>
   <main class="container">
+    <div id="flash-container">
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% if messages %}
-        <div class="flashes">
           {% for cat,msg in messages %}
             <div class="flash {{ cat }}">{{ msg }}</div>
           {% endfor %}
-        </div>
       {% endif %}
     {% endwith %}
+    </div>
     {% block content %}{% endblock %}
   </main>
   <footer class="footer">
-    <small>&copy; {{ 2025 }} {{ app_name }} • Built with Flask 3</small>
+    <small>&copy; 2025 {{ app_name }}</small>
   </footer>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
 """, encoding="utf-8")
 
     # index.html
     (TEMPLATES_DIR / "index.html").write_text("""{% extends "layout.html" %}{% block content %}
-<h1>Design Your Dream Home</h1>
+<div class="hero">
+  <h1>Design Your Dream Home with AI</h1>
+  <p>Bring your vision to life. Describe your ideal home, and our AI will generate stunning, photorealistic renderings in moments.</p>
+</div>
 <form class="card" action="{{ url_for('generate') }}" method="post" enctype="multipart/form-data">
-  <label>Home Description (or use Voice)</label>
-  <textarea id="description" name="description" rows="4" placeholder="e.g., Modern farmhouse with warm wood, metal roof, indoor-outdoor living..."></textarea>
+  <h2>1. Describe Your Home</h2>
+  <textarea id="description" name="description" rows="4" placeholder="e.g., A two-story modern farmhouse with a wrap-around porch, black metal roof, and large windows. Include a lush garden and a stone pathway..."></textarea>
   <div class="row gap">
-    <button type="button" id="voiceBtn">🎤 Voice Prompt</button>
-    <label class="file">
+    <button type="button" id="voiceBtn" class="button">🎤 Use Voice</button>
+    <label class="file-label">
       <input type="file" name="plan_file" accept="image/*,.pdf">
-      <span>Upload Architectural Plan (optional)</span>
+      <span>📤 Upload Plan (Optional)</span>
     </label>
   </div>
-  <button class="primary" type="submit">Generate House Plan (Front & Back)</button>
+  
+  <h2>2. Generate Exteriors</h2>
+  <button class="primary" type="submit">Generate House Exteriors</button>
 </form>
-
-<section class="card">
-  <h2>Quick Rooms</h2>
-  <p>After you generate exteriors, you’ll see a list of rooms. You can then choose options and render each.</p>
-  <ul class="pill-list">
-    {% for r in basic_rooms %}
-      <li>{{ r }}</li>
-    {% endfor %}
-  </ul>
-</section>
 {% endblock %}
 """, encoding="utf-8")
 
     # gallery.html
     (TEMPLATES_DIR / "gallery.html").write_text("""{% extends "layout.html" %}{% block content %}
-<h1>Your Renderings</h1>
+<h1>My Renderings</h1>
 
-<div id="imageModal" class="modal" style="display:none;">
-  <span id="closeModal" class="close">&times;</span>
-  <img class="modal-content" id="modalImg">
-  <div id="caption"></div>
+<!-- Bulk Actions -->
+<div class="card bulk-actions">
+    <div class="row space">
+        <div>
+            <label><input type="checkbox" id="selectAll"> Select All</label>
+            <button id="likeBtn">❤️ Like</button>
+            <button id="favBtn">⭐ Favorite</button>
+            <button id="deleteBtn">🗑️ Delete</button>
+            <button id="downloadBtn">📥 Download Liked</button>
+        </div>
+        <div class="row gap">
+            <input type="email" id="emailInput" placeholder="recipient@example.com">
+            <button id="emailBtn">📧 Email Liked</button>
+        </div>
+    </div>
+    {% if show_slideshow %}
+    <a href="{{ url_for('slideshow') }}" class="button primary">▶️ View Favorites Slideshow</a>
+    {% endif %}
 </div>
 
-<form class="card" action="{{ url_for('bulk_action') }}" method="post" id="bulkForm">
-  <div class="grid">
+<!-- Renderings Grid -->
+<div id="renderingsGrid" class="grid">
     {% for r in items %}
-    <div class="render-card">
-      <input type="checkbox" name="rendering_ids" value="{{ r['id'] }}">
-      <img src="{{ url_for('static', filename=r['image_path']) }}" 
-           alt="{{ r['subcategory'] }}"
-           class="render-img modal-trigger" data-id="{{ r['id'] }}">
-      <div class="meta">
-        <span class="tag">{{ r['subcategory'] }}</span>
-      </div>
-      <form action="{{ url_for('modify_rendering') }}" method="post">
-        <input type="hidden" name="rendering_id" value="{{ r['id'] }}">
-        <textarea name="description" rows="2" placeholder="Describe Changes..."></textarea>
-        {% if options[r['subcategory']] %}
-        <div class="options-grid">
-          {% for opt, vals in options[r['subcategory']].items() %}
-          <label>{{ opt }}
-            <select name="{{ opt }}">
-              {% for v in vals %}
-              <option value="{{ v }}">{{ v }}</option>
-              {% endfor %}
-            </select>
-          </label>
-          {% endfor %}
+    <div class="render-card" data-id="{{ r['id'] }}">
+        <input type="checkbox" name="rendering_id" class="rendering-checkbox">
+        <img src="{{ url_for('static', filename=r['image_path']) }}" alt="{{ r['subcategory'] }}" class="render-img modal-trigger">
+        <div class="meta">
+            <span class="tag">{{ r['subcategory'] }}</span>
+            <div class="actions">
+                <button class="action-btn like-btn {% if r['liked'] %}active{% endif %}" title="Like">❤️</button>
+                <button class="action-btn fav-btn {% if r['favorited'] %}active{% endif %}" title="Favorite">⭐</button>
+                <button class="action-btn dark-toggle" title="Toggle Dark Mode">🌙</button>
+            </div>
         </div>
-        {% endif %}
-        <button type="submit">Modify Rendering</button>
-      </form>
+        <div class="modify-section">
+            <details>
+                <summary>Modify This Rendering</summary>
+                <form class="modify-form" data-id="{{ r['id'] }}">
+                    <textarea name="description" rows="2" placeholder="Describe changes... e.g., 'make the walls light gray'"></textarea>
+                    {% if options[r['subcategory']] %}
+                    <div class="options-grid">
+                      {% for opt, vals in options[r['subcategory']].items() %}
+                      <label>{{ opt }}
+                        <select name="{{ opt }}">
+                          {% set current_val = (r['options_json'] | fromjson)[opt] %}
+                          <option value="">-- Default --</option>
+                          {% for v in vals %}
+                          <option value="{{ v }}" {% if v == current_val %}selected{% endif %}>{{ v }}</option>
+                          {% endfor %}
+                        </select>
+                      </label>
+                      {% endfor %}
+                    </div>
+                    {% endif %}
+                    <button type="submit" class="button">Regenerate</button>
+                </form>
+            </details>
+        </div>
     </div>
     {% endfor %}
-  </div>
-</form>
+</div>
+
+<!-- Room Generation -->
+<div class="card">
+    <h2>Generate a New Room</h2>
+    <form id="generateRoomForm">
+        <select id="roomSelect" name="subcategory">
+            {% for room in rooms %}
+            <option value="{{ room }}">{{ room }}</option>
+            {% endfor %}
+        </select>
+        <div id="roomOptionsContainer"></div>
+        <button type="submit" class="primary">Generate Room</button>
+    </form>
+</div>
+
+<!-- Modal -->
+<div id="imageModal" class="modal"><span class="close-modal">&times;</span><img class="modal-content" id="modalImg"></div>
 
 <script>
-  // Fullscreen modal
-  const modal=document.getElementById("imageModal");
-  const modalImg=document.getElementById("modalImg");
-  const caption=document.getElementById("caption");
-  document.querySelectorAll('.modal-trigger').forEach(img=>{
-    img.addEventListener('click',()=>{
-      modal.style.display="block";
-      modalImg.src=img.src;
-      caption.innerHTML=img.alt;
-    });
-  });
-  document.getElementById("closeModal").onclick=()=>modal.style.display="none";
+    const ROOM_OPTIONS = {{ options | tojson }};
 </script>
 {% endblock %}
 """, encoding="utf-8")
 
     # slideshow.html
     (TEMPLATES_DIR / "slideshow.html").write_text("""{% extends "layout.html" %}{% block content %}
-<h1>Favorites Slideshow</h1>
-<div class="slideshow">
-  {% for r in items %}
-    <img src="{{ url_for('static', filename=r['image_path']) }}" class="slide" {% if not loop.first %}style="display:none"{% endif %}>
-  {% endfor %}
-</div>
-<div class="row gap">
-  <button id="prev">Prev</button>
-  <button id="next">Next</button>
-  <button id="toggleDark"> Toggle Dark</button>
-  <a href="{{ url_for('gallery') }}" class="button"> Back to Rooms</a>
+<div class="slideshow-container">
+  <h1>Favorites Slideshow</h1>
+  <div class="slideshow">
+    {% for r in items %}
+      <div class="slide" {% if not loop.first %}style="display:none;"{% endif %}>
+        <img src="{{ url_for('static', filename=r['image_path']) }}" alt="{{ r['subcategory'] }}">
+        <div class="caption">{{ r['subcategory'] }}</div>
+      </div>
+    {% endfor %}
+  </div>
+  <div class="row gap center">
+    <button id="prev" class="button">❮ Prev</button>
+    <a href="{{ url_for('gallery') }}" class="button">Back to Gallery</a>
+    <button id="toggleDark" class="button">Toggle Dark 🌙</button>
+    <button id="next" class="button">Next ❯</button>
+  </div>
 </div>
 <script>
   const slides=[...document.querySelectorAll('.slide')];
@@ -921,137 +904,352 @@ def write_template_files_if_missing():
   function show(i){slides.forEach((s,j)=>s.style.display=(i===j?'block':'none'));}
   document.getElementById('prev').onclick=()=>{idx=(idx-1+slides.length)%slides.length;show(idx);}
   document.getElementById('next').onclick=()=>{idx=(idx+1)%slides.length;show(idx);}
-  document.getElementById('toggleDark').onclick=()=>{slides[idx].classList.toggle('dark');};
+  document.getElementById('toggleDark').onclick=()=>{
+      const currentImg = slides[idx].querySelector('img');
+      if (currentImg) currentImg.classList.toggle('dark');
+  };
 </script>
 {% endblock %}
 """, encoding="utf-8")
 
     # login.html
     (TEMPLATES_DIR / "login.html").write_text("""{% extends "layout.html" %}{% block content %}
-<h1>Login</h1>
-<form class="card" method="post">
-  <label>Email</label>
-  <input type="email" name="email" required>
-  <label>Password</label>
-  <input type="password" name="password" required>
-  <button class="primary">Login</button>
-</form>
-<p>No account? <a href="{{ url_for('register') }}">Register here</a>.</p>
+<div class="auth-form">
+  <h1>Login</h1>
+  <form class="card" method="post">
+    <label>Email</label>
+    <input type="email" name="email" required>
+    <label>Password</label>
+    <input type="password" name="password" required>
+    <button class="primary">Login</button>
+  </form>
+  <p>No account? <a href="{{ url_for('register') }}">Register here</a>.</p>
+</div>
 {% endblock %}
 """, encoding="utf-8")
 
     # register.html
     (TEMPLATES_DIR / "register.html").write_text("""{% extends "layout.html" %}{% block content %}
-<h1>Create Account</h1>
-<form class="card" method="post">
-  <label>Name</label>
-  <input type="text" name="name" placeholder="(optional)">
-  <label>Email</label>
-  <input type="email" name="email" required>
-  <label>Password</label>
-  <input type="password" name="password" required>
-  <button class="primary">Create Account</button>
-</form>
+<div class="auth-form">
+  <h1>Create Account</h1>
+  <form class="card" method="post">
+    <label>Name</label>
+    <input type="text" name="name" placeholder="(optional)">
+    <label>Email</label>
+    <input type="email" name="email" required>
+    <label>Password</label>
+    <input type="password" name="password" required>
+    <button class="primary">Create Account</button>
+  </form>
+</div>
 {% endblock %}
 """, encoding="utf-8")
 
 def write_basic_static_if_missing():
-    """Create minimal static assets safely (no raw CSS in Python)."""
+    """Create minimal static assets safely."""
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    
+    (STATIC_DIR / "app.css").write_text("""
+:root { --bg: #f4f7fa; --text: #1a202c; --card-bg: #fff; --border: #e2e8f0; --primary: #4a6dff; --primary-text: #fff; --hover: #f0f3ff; }
+body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: var(--bg); color: var(--text); line-height: 1.6; }
+.container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
+.topbar { display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-bottom: 1px solid var(--border); background-color: var(--card-bg); }
+.brand { font-weight: bold; text-decoration: none; color: var(--text); }
+.nav a { margin-left: 1rem; text-decoration: none; color: var(--text); }
+.card { background-color: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
+.button, button { background-color: #e2e8f0; color: #2d3748; border: none; padding: 0.75rem 1rem; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
+.button.primary, button.primary { background-color: var(--primary); color: var(--primary-text); }
+.row { display: flex; align-items: center; }
+.gap > * { margin-right: 0.5rem; }
+.center { justify-content: center; }
+.space { justify-content: space-between; }
+input, textarea, select { width: 100%; padding: 0.75rem; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 1rem; box-sizing: border-box; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
+.render-card { position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.render-img { width: 100%; height: auto; display: block; aspect-ratio: 1/1; object-fit: cover; cursor: pointer; }
+.render-img.dark { filter: invert(1) hue-rotate(180deg); }
+.meta { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem; }
+.actions { display: flex; gap: 0.5rem; }
+.action-btn { background: none; border: none; font-size: 1.2rem; cursor: pointer; padding: 0; }
+.action-btn.active { color: #ff5252; } /* Example for liked/favorited */
+.fav-btn.active { color: #fdd835; }
+.dark-toggle { font-size: 1.2rem; }
+.rendering-checkbox { position: absolute; top: 10px; left: 10px; width: 20px; height: 20px; }
+.modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.9); }
+.modal-content { margin: auto; display: block; max-width: 90%; max-height: 90%; }
+.close-modal { position: absolute; top: 15px; right: 35px; color: #f1f1f1; font-size: 40px; font-weight: bold; cursor: pointer; }
+.slideshow-container { text-align: center; }
+.slide { display: none; }
+.slide img { max-width: 100%; max-height: 70vh; border-radius: 8px; }
+.flash { padding: 1rem; margin-bottom: 1rem; border-radius: 6px; }
+.flash.success { background-color: #c6f6d5; color: #22543d; }
+.flash.danger { background-color: #fed7d7; color: #822727; }
+.flash.warning { background-color: #feebc8; color: #9c4221; }
+.flash.info { background-color: #bee3f8; color: #2c5282; }
+.options-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+.modify-section details { margin-top: 0.5rem; }
+.modify-section summary { cursor: pointer; font-weight: bold; }
+.modify-form { padding-top: 1rem; }
+.auth-form { max-width: 400px; margin: 2rem auto; }
+.file-label input[type="file"] { display: none; }
+.file-label span { border: 1px solid #ccc; padding: 0.75rem 1rem; border-radius: 6px; cursor: pointer; background: #f9f9f9; }
+    """, encoding="utf-8")
 
-    # -------- CSS (app.css) --------
-    css_path = STATIC_DIR / "app.css"
-    if not css_path.exists():
-        css_lines = [
-            "/* Default stylesheet for Architect 3D Home Modeler */",
-            "body{margin:0;background:#0b0f14;color:#e8eef7;font-family:system-ui,Segoe UI,Roboto,Arial}",
-            ".topbar{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;border-bottom:1px solid #1f2835;background:#0e131a}",
-            ".brand{color:#e8eef7;text-decoration:none;font-weight:700}",
-            ".nav a{color:#9fb0c6;margin-left:14px;text-decoration:none}",
-            ".container{max-width:1100px;margin:20px auto;padding:0 16px}",
-            ".card{background:#141a22;border:1px solid #1f2835;padding:16px;border-radius:10px;margin-bottom:16px}",
-            ".row{display:flex;align-items:center}.space{justify-content:space-between}.gap>*{margin-right:8px}",
-            ".file input{display:none}.file span{border:1px dashed #2a3546;padding:10px;border-radius:6px;cursor:pointer}",
-            ".primary{background:#6aa6ff;color:#06101e;border:0;padding:10px 14px;border-radius:8px;cursor:pointer}",
-            ".button{background:#2a3546;color:#e8eef7;padding:8px 12px;border-radius:8px;text-decoration:none}",
-            ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}",
-            ".render-card{position:relative;background:#0e141b;border:1px solid #1d2533;border-radius:12px;padding:10px}",
-            ".render-img{width:100%;height:auto;border-radius:8px;cursor:pointer}",
-            ".modal{display:none;position:fixed;z-index:2000;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,.9)}",
-            ".modal-content{display:block;max-width:95%;max-height:95%;margin:auto;border-radius:8px}",
-            ".close{position:absolute;top:16px;right:24px;font-size:36px;color:#fff;cursor:pointer}",
-            ".voice-box{display:flex;gap:8px;align-items:center}",
-            ".voice-btn{background:#223047;color:#cfe3ff;border:0;border-radius:6px;padding:6px 10px;cursor:pointer}",
-        ]
-        css_path.write_text("\n".join(css_lines), encoding="utf-8")
+    (STATIC_DIR / "app.js").write_text("""
+document.addEventListener('DOMContentLoaded', function() {
+    // --- MODAL ---
+    const modal = document.getElementById('imageModal');
+    if (modal) {
+        document.addEventListener('click', e => {
+            if (e.target.classList.contains('modal-trigger')) {
+                modal.style.display = 'block';
+                document.getElementById('modalImg').src = e.target.src;
+            }
+            if (e.target.classList.contains('close-modal')) {
+                modal.style.display = 'none';
+            }
+        });
+        window.addEventListener('click', e => {
+            if (e.target === modal) {
+                modal.style.display = 'none';
+            }
+        });
+    }
 
-    # -------- JS (app.js) --------
-    js_path = STATIC_DIR / "app.js"
-    if not js_path.exists():
-        js_lines = [
-            "// Default JS for Architect 3D Home Modeler",
-            "",
-            "// Fullscreen modal image viewer",
-            "document.addEventListener('click', function(e){",
-            "  const img = e.target.closest('.render-img');",
-            "  if(!img) return;",
-            "  const modal = document.getElementById('imageModal');",
-            "  const modalImg = document.getElementById('modalImg');",
-            "  const caption = document.getElementById('caption');",
-            "  if(modal && modalImg){",
-            "    modal.style.display = 'block';",
-            "    modalImg.src = img.src;",
-            "    if(caption) caption.textContent = img.alt || '';",
-            "  }",
-            "});",
-            "window.closeModal = function(){",
-            "  const modal = document.getElementById('imageModal');",
-            "  if(modal) modal.style.display = 'none';",
-            "};",
-            "",
-            "// Voice input for Describe Changes",
-            "window.startVoice = function(id){",
-            "  if(!('webkitSpeechRecognition' in window)){",
-            "    alert('Voice recognition not supported in this browser.');",
-            "    return;",
-            "  }",
-            "  const rec = new webkitSpeechRecognition();",
-            "  rec.continuous = false; rec.interimResults = false; rec.lang = 'en-US';",
-            "  rec.start();",
-            "  rec.onresult = function(e){",
-            "    const txt = Array.from(e.results).map(r=>r[0].transcript).join(' ');",
-            "    const area = document.getElementById('desc-' + id);",
-            "    if(area) area.value = txt;",
-            "  };",
-            "};",
-        ]
-        js_path.write_text("\n".join(js_lines), encoding="utf-8")
+    // --- VOICE PROMPT ---
+    const voiceBtn = document.getElementById('voiceBtn');
+    const description = document.getElementById('description');
+    if (voiceBtn && description) {
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            const recognition = new SpeechRecognition();
+            recognition.onresult = (event) => {
+                description.value = event.results[0][0].transcript;
+            };
+            voiceBtn.addEventListener('click', () => recognition.start());
+        } else {
+            voiceBtn.style.display = 'none';
+        }
+    }
+    
+    // --- GALLERY PAGE ---
+    if (document.getElementById('renderingsGrid')) {
+        const grid = document.getElementById('renderingsGrid');
+        const selectAll = document.getElementById('selectAll');
 
-    # -------- Favicon --------
+        // Individual card actions (Like, Fav, Dark Mode)
+        grid.addEventListener('click', e => {
+            const card = e.target.closest('.render-card');
+            if (!card) return;
+            const id = card.dataset.id;
+
+            if (e.target.classList.contains('like-btn') || e.target.classList.contains('fav-btn')) {
+                const action = e.target.classList.contains('like-btn') ? 'like' : 'favorite';
+                handleBulkAction(action, [id]).then(() => {
+                    e.target.classList.toggle('active');
+                });
+            } else if (e.target.classList.contains('dark-toggle')) {
+                card.querySelector('.render-img').classList.toggle('dark');
+            }
+        });
+        
+        // Select All
+        selectAll.addEventListener('change', e => {
+            document.querySelectorAll('.rendering-checkbox').forEach(cb => cb.checked = e.target.checked);
+        });
+
+        // Bulk action buttons
+        setupBulkActionBtn('likeBtn', 'like');
+        setupBulkActionBtn('favBtn', 'favorite');
+        setupBulkActionBtn('deleteBtn', 'delete', true);
+        setupBulkActionBtn('downloadBtn', 'download');
+        setupBulkActionBtn('emailBtn', 'email');
+
+        // Modify Rendering Form Submission
+        document.querySelectorAll('.modify-form').forEach(form => {
+            form.addEventListener('submit', async e => {
+                e.preventDefault();
+                const id = form.dataset.id;
+                const formData = new FormData(form);
+                const button = form.querySelector('button');
+                button.textContent = 'Generating...';
+                button.disabled = true;
+
+                try {
+                    const response = await fetch(`/modify_rendering/${id}`, { method: 'POST', body: formData });
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.error);
+                    showFlash(result.message, 'success');
+                    // Add new card to grid
+                    const newCard = createRenderCard(result.id, result.path, result.subcategory);
+                    grid.insertAdjacentElement('afterbegin', newCard);
+                } catch (error) {
+                    showFlash(error.message, 'danger');
+                } finally {
+                    button.textContent = 'Regenerate';
+                    button.disabled = false;
+                }
+            });
+        });
+        
+        // Generate New Room
+        const roomForm = document.getElementById('generateRoomForm');
+        const roomSelect = document.getElementById('roomSelect');
+        const roomOptionsContainer = document.getElementById('roomOptionsContainer');
+        
+        function updateRoomOptions() {
+            const subcategory = roomSelect.value;
+            const options = ROOM_OPTIONS[subcategory];
+            roomOptionsContainer.innerHTML = '';
+            if (options) {
+                const container = document.createElement('div');
+                container.className = 'options-grid';
+                for (const [opt, vals] of Object.entries(options)) {
+                    const label = document.createElement('label');
+                    label.textContent = opt;
+                    const select = document.createElement('select');
+                    select.name = opt;
+                    vals.forEach(v => {
+                        const option = document.createElement('option');
+                        option.value = v;
+                        option.textContent = v;
+                        select.appendChild(option);
+                    });
+                    label.appendChild(select);
+                    container.appendChild(label);
+                }
+                roomOptionsContainer.appendChild(container);
+            }
+        }
+        
+        roomSelect.addEventListener('change', updateRoomOptions);
+        updateRoomOptions();
+
+        roomForm.addEventListener('submit', async e => {
+            e.preventDefault();
+            const formData = new FormData(roomForm);
+            const button = roomForm.querySelector('button');
+            button.textContent = 'Generating...';
+            button.disabled = true;
+
+            try {
+                const response = await fetch('/generate_room', { method: 'POST', body: formData });
+                const result = await response.json();
+                if (!response.ok) throw new Error(result.error);
+                showFlash(result.message, 'success');
+                const newCard = createRenderCard(result.id, result.path, result.subcategory);
+                grid.insertAdjacentElement('afterbegin', newCard);
+            } catch (error) {
+                showFlash(error.message, 'danger');
+            } finally {
+                button.textContent = 'Generate Room';
+                button.disabled = false;
+            }
+        });
+    }
+});
+
+function setupBulkActionBtn(btnId, action, reload = false) {
+    const btn = document.getElementById(btnId);
+    if(btn) {
+        btn.addEventListener('click', () => {
+            const ids = getSelectedIds();
+            if (ids.length > 0) {
+                handleBulkAction(action, ids, reload);
+            } else {
+                showFlash('Please select one or more renderings.', 'warning');
+            }
+        });
+    }
+}
+
+async function handleBulkAction(action, ids, reload = false) {
+    const body = new FormData();
+    body.append('action', action);
+    body.append('ids', JSON.stringify(ids));
+
+    if (action === 'email') {
+        const email = document.getElementById('emailInput').value;
+        if (!email) {
+            showFlash('Please enter an email address.', 'warning');
+            return;
+        }
+        body.append('to_email', email);
+    }
+    
+    try {
+        const response = await fetch('/bulk_action', { method: 'POST', body: body });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error);
+        
+        if (action === 'download') {
+            result.download_urls.forEach(url => {
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = url.split('/').pop();
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            });
+        }
+        
+        showFlash(result.message || 'Action completed!', 'success');
+        if (reload) {
+            window.location.reload();
+        }
+    } catch (error) {
+        showFlash(error.message, 'danger');
+    }
+}
+
+function getSelectedIds() {
+    return [...document.querySelectorAll('.rendering-checkbox:checked')]
+        .map(cb => cb.closest('.render-card').dataset.id);
+}
+
+function showFlash(message, category) {
+    const container = document.getElementById('flash-container');
+    const flash = document.createElement('div');
+    flash.className = `flash ${category}`;
+    flash.textContent = message;
+    container.prepend(flash);
+    setTimeout(() => flash.remove(), 5000);
+}
+
+function createRenderCard(id, path, subcategory) {
+    const card = document.createElement('div');
+    card.className = 'render-card';
+    card.dataset.id = id;
+    card.innerHTML = `
+        <input type="checkbox" class="rendering-checkbox">
+        <img src="${path}" alt="${subcategory}" class="render-img modal-trigger">
+        <div class="meta">
+            <span class="tag">${subcategory}</span>
+            <div class="actions">
+                <button class="action-btn like-btn" title="Like">❤️</button>
+                <button class="action-btn fav-btn" title="Favorite">⭐</button>
+                <button class="action-btn dark-toggle" title="Toggle Dark Mode">🌙</button>
+            </div>
+        </div>
+        <div class="modify-section">
+            <details><summary>Modify This Rendering</summary>...omitted for brevity...</details>
+        </div>
+    `;
+    return card;
+}
+    """, encoding="utf-8")
+    
     ico = STATIC_DIR / "favicon.ico"
     if not ico.exists():
         from PIL import Image, ImageDraw
-        img = Image.new("RGBA", (64, 64), (10, 16, 24, 255))
+        img = Image.new("RGBA", (32, 32))
         d = ImageDraw.Draw(img)
-        d.rectangle([8, 8, 56, 56], outline=(106, 166, 255, 255), width=3)
-        d.text((16, 22), "A3", fill=(200, 220, 255, 255))
+        d.rectangle([4, 4, 28, 28], fill="#4a6dff")
+        d.text((8, 8), "A3D", fill="#fff")
         img.save(ico, format="ICO")
 
 
 # ---------- Main ----------
 
 if __name__ == "__main__":
-    # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
-
-
-
-
-
-
-
-
-
-
-
-
