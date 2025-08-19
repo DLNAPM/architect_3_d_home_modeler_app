@@ -418,7 +418,10 @@ def index():
 @app.post("/generate")
 @login_required
 def generate():
-    """Generate Front & Back exteriors immediately, then show rooms."""
+    """
+    Generate Front & Back exteriors, save them, store their IDs in the session,
+    and redirect to the gallery to display them.
+    """
     description = request.form.get("description", "").strip()
     plan_file = request.files.get("plan_file")
     plan_uploaded = False
@@ -429,32 +432,41 @@ def generate():
         plan_path = UPLOAD_DIR / safe_name
         plan_file.save(plan_path)
 
-    # FRONT & BACK prompts
+    # --- FIX --- This logic is corrected to show new images after generation.
     front_prompt = build_prompt("Front Exterior", {}, description, plan_uploaded)
     back_prompt  = build_prompt("Back Exterior",  {},  description, plan_uploaded)
 
-    paths = []
-    for subcat, prompt in [("Front Exterior", front_prompt), ("Back Exterior", back_prompt)]:
+    paths_and_prompts = [
+        ("Front Exterior", front_prompt),
+        ("Back Exterior", back_prompt)
+    ]
+    
+    new_rendering_ids = []
+    conn = get_db()
+    cur = conn.cursor()
+    user_id = session.get("user_id")
+
+    for subcat, prompt in paths_and_prompts:
         try:
             rel_path = generate_image_via_openai(prompt)
-            paths.append((subcat, rel_path, prompt))
+            now = datetime.utcnow().isoformat()
+            
+            cur.execute("""
+                INSERT INTO renderings (user_id, category, subcategory, options_json, prompt, image_path, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, "EXTERIOR", subcat, json.dumps({}), prompt, rel_path, now))
+            conn.commit()  # Commit after each insert to get the correct lastrowid
+            new_rendering_ids.append(cur.lastrowid)
+
         except Exception as e:
+            conn.close()
             flash(str(e), "danger")
             return redirect(url_for("index"))
 
-    user_id = session.get("user_id")
-    conn = get_db()
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
-
-    for subcat, rel_path, prompt in paths:
-        cur.execute("""
-            INSERT INTO renderings (user_id, category, subcategory, options_json, prompt, image_path, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, "EXTERIOR", subcat, json.dumps({}), prompt, rel_path, now))
-    conn.commit()
     conn.close()
-
+    
+    # Store the new IDs in the session to be displayed on the gallery page
+    session['new_rendering_ids'] = new_rendering_ids
     flash("Generated Front & Back exterior renderings!", "success")
     return redirect(url_for("gallery"))
 
@@ -501,28 +513,35 @@ def generate_room():
 @login_required
 def gallery():
     user = current_user()
+    
+    # --- FIX --- Pop the IDs of newly created renderings from the session
+    new_ids = session.pop('new_rendering_ids', [])
+    
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""SELECT * FROM renderings WHERE user_id = ? ORDER BY created_at DESC""", (user["id"],))
     items = [dict(row) for row in cur.fetchall()]
     conn.close()
 
-    # --- FIX ---
-    # Parse the JSON string into a dictionary here, in the Python code
     for item in items:
         try:
             item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
         except (json.JSONDecodeError, TypeError):
-            item['options_dict'] = {} # Use an empty dict if JSON is invalid or null
+            item['options_dict'] = {}
     
-    all_rooms = build_room_list("") # Assuming no basement by default on gallery load
+    # Filter out the new items to be displayed separately
+    new_items = [item for item in items if item['id'] in new_ids]
     
+    all_rooms = build_room_list("")
     fav_count = sum(1 for r in items if r["favorited"])
+    
     return render_template("gallery.html",
                            app_name=APP_NAME, user=user, items=items,
+                           new_items=new_items,  # Pass new items to the template
                            show_slideshow=(fav_count >= 2),
                            rooms=all_rooms,
                            options=OPTIONS)
+
 
 @app.post("/bulk_action")
 @login_required
@@ -800,6 +819,24 @@ def write_template_files_if_missing():
     (TEMPLATES_DIR / "gallery.html").write_text("""{% extends "layout.html" %}{% block content %}
 <h1>My Renderings</h1>
 
+{# --- FIX --- Display newly generated renderings passed from the session #}
+{% if new_items %}
+<div class="card">
+  <h2>Newly Generated</h2>
+  <div class="grid">
+    {% for r in new_items %}
+    <div class="render-card-simple">
+      <img src="{{ url_for('static', filename=r.image_path) }}" alt="{{ r.subcategory }}" class="render-img modal-trigger">
+      <div class="meta">
+        <span class="tag">{{ r.subcategory }}</span>
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+
 <!-- Bulk Actions -->
 <div class="card bulk-actions">
     <div class="row space">
@@ -844,7 +881,6 @@ def write_template_files_if_missing():
                       {% for opt, vals in options[r['subcategory']].items() %}
                       <label>{{ opt }}
                         <select name="{{ opt }}">
-                          {# --- FIX --- Use the pre-parsed 'options_dict' and .get() for safety #}
                           {% set current_val = r['options_dict'].get(opt) %}
                           <option value="">-- Default --</option>
                           {% for v in vals %}
@@ -973,6 +1009,7 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Ro
 input, textarea, select { width: 100%; padding: 0.75rem; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 1rem; box-sizing: border-box; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
 .render-card { position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.render-card-simple { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .render-img { width: 100%; height: auto; display: block; aspect-ratio: 1/1; object-fit: cover; cursor: pointer; }
 .render-img.dark { filter: invert(1) hue-rotate(180deg); }
 .meta { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem; }
@@ -1061,9 +1098,11 @@ document.addEventListener('DOMContentLoaded', function() {
         });
         
         // Select All
-        selectAll.addEventListener('change', e => {
-            document.querySelectorAll('.rendering-checkbox').forEach(cb => cb.checked = e.target.checked);
-        });
+        if (selectAll) {
+            selectAll.addEventListener('change', e => {
+                document.querySelectorAll('.rendering-checkbox').forEach(cb => cb.checked = e.target.checked);
+            });
+        }
 
         // Bulk action buttons
         setupBulkActionBtn('likeBtn', 'like');
@@ -1129,30 +1168,34 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         }
         
-        roomSelect.addEventListener('change', updateRoomOptions);
-        updateRoomOptions();
+        if (roomSelect) {
+            roomSelect.addEventListener('change', updateRoomOptions);
+            updateRoomOptions();
+        }
 
-        roomForm.addEventListener('submit', async e => {
-            e.preventDefault();
-            const formData = new FormData(roomForm);
-            const button = roomForm.querySelector('button');
-            button.textContent = 'Generating...';
-            button.disabled = true;
+        if (roomForm) {
+            roomForm.addEventListener('submit', async e => {
+                e.preventDefault();
+                const formData = new FormData(roomForm);
+                const button = roomForm.querySelector('button');
+                button.textContent = 'Generating...';
+                button.disabled = true;
 
-            try {
-                const response = await fetch('/generate_room', { method: 'POST', body: formData });
-                const result = await response.json();
-                if (!response.ok) throw new Error(result.error);
-                showFlash(result.message, 'success');
-                const newCard = createRenderCard(result.id, result.path, result.subcategory);
-                grid.insertAdjacentElement('afterbegin', newCard);
-            } catch (error) {
-                showFlash(error.message, 'danger');
-            } finally {
-                button.textContent = 'Generate Room';
-                button.disabled = false;
-            }
-        });
+                try {
+                    const response = await fetch('/generate_room', { method: 'POST', body: formData });
+                    const result = await response.json();
+                    if (!response.ok) throw new Error(result.error);
+                    showFlash(result.message, 'success');
+                    const newCard = createRenderCard(result.id, result.path, result.subcategory);
+                    grid.insertAdjacentElement('afterbegin', newCard);
+                } catch (error) {
+                    showFlash(error.message, 'danger');
+                } finally {
+                    button.textContent = 'Generate Room';
+                    button.disabled = false;
+                }
+            });
+        }
     }
 });
 
@@ -1202,7 +1245,8 @@ async function handleBulkAction(action, ids, reload = false) {
         
         showFlash(result.message || 'Action completed!', 'success');
         if (reload) {
-            window.location.reload();
+            // A small delay allows the user to read the flash message before reloading
+            setTimeout(() => window.location.reload(), 1500);
         }
     } catch (error) {
         showFlash(error.message, 'danger');
@@ -1227,6 +1271,8 @@ function createRenderCard(id, path, subcategory) {
     const card = document.createElement('div');
     card.className = 'render-card';
     card.dataset.id = id;
+    // This is a simplified version; for a full match, it needs the modify form etc.
+    // For now, this is sufficient to show the new image.
     card.innerHTML = `
         <input type="checkbox" class="rendering-checkbox">
         <img src="${path}" alt="${subcategory}" class="render-img modal-trigger">
@@ -1239,7 +1285,9 @@ function createRenderCard(id, path, subcategory) {
             </div>
         </div>
         <div class="modify-section">
-            <details><summary>Modify This Rendering</summary>...omitted for brevity...</details>
+            <details><summary>Modify This Rendering</summary>
+            <p class="small-text">Refresh page to load modification options for new renderings.</p>
+            </details>
         </div>
     `;
     return card;
