@@ -10,13 +10,12 @@ Architect 3D Home Modeler – Flask 3.x single-file app
 - Dark mode toggle per rendering (CSS filter)
 - @app.before_request + guard for one-time init (Flask 3.x safe)
 - Auto-scaffold templates/ and static/ on first run
-# ---------Recent Updates 08202025 v2 -----------
-- FIXED: Corrected layout for newly generated exteriors to be full-featured and not duplicated.
-- FIXED: Restored the "Generate a New Room" section to all gallery views.
-- FIXED: The "Modify Rendering" button is now fully functional.
+# ---------Recent Updates 08202025 v3 -----------
+- FIXED: Corrected layout for newly generated exteriors to prevent stacking.
+- FIXED: Restored the dynamic options for the "Generate a New Room" feature.
+- ADDED: Implemented a slideshow for guest/session renderings.
 - Redesigned landing page to match professional layout.
 - Created a dedicated page for guest/session renderings.
-- Added a conditional "View Session" button to the main navigation.
 """
 
 import os
@@ -369,7 +368,6 @@ def generate():
     
     conn.close()
     
-    # Store IDs in session for both guests and logged-in users to highlight new images
     session['new_rendering_ids'] = new_rendering_ids
     if not user_id:
         guest_ids = session.get('guest_rendering_ids', [])
@@ -377,7 +375,6 @@ def generate():
         session['guest_rendering_ids'] = guest_ids
 
     flash("Generated Front & Back exterior renderings!", "success")
-    # Redirect to the correct gallery based on login status
     return redirect(url_for("gallery" if user_id else "session_gallery"))
 
 @app.post("/generate_room")
@@ -426,14 +423,12 @@ def gallery():
     
     new_ids = session.pop('new_rendering_ids', [])
     new_items = [item for item in all_items if item['id'] in new_ids]
-    
-    # --- FIX --- Exclude new items from the main list to prevent duplication on the same page load
     main_items = [item for item in all_items if item['id'] not in new_ids]
     
     for item in all_items: item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
 
     fav_count = sum(1 for r in main_items if r.get("favorited"))
-    all_rooms = build_room_list("") # Pass the room list to the template
+    all_rooms = build_room_list("")
 
     return render_template("gallery.html", app_name=APP_NAME, user=user, items=main_items,
                            new_items=new_items, show_slideshow=(fav_count >= 2),
@@ -457,7 +452,6 @@ def session_gallery():
         
     for item in items: item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
     
-    # --- FIX --- Pass room list to the session gallery template
     all_rooms = build_room_list("")
 
     return render_template("session_gallery.html", app_name=APP_NAME, user=user, items=items, 
@@ -475,7 +469,23 @@ def slideshow():
     # (Implementation remains the same)
     pass
 
-# --- CRITICAL FIX --- The route decorator and function signature were incorrect.
+@app.get("/session_slideshow")
+def session_slideshow():
+    guest_ids = session.get('guest_rendering_ids', [])
+    if len(guest_ids) < 2:
+        flash("You need at least two session renderings for a slideshow.", "info")
+        return redirect(url_for('session_gallery'))
+    
+    conn = get_db()
+    cur = conn.cursor()
+    q_marks = ",".join("?" for _ in guest_ids)
+    # We can add an ORDER BY clause if needed, but session order might be fine
+    cur.execute(f"SELECT * FROM renderings WHERE id IN ({q_marks})", guest_ids)
+    items = [dict(row) for row in cur.fetchall()]
+    conn.close()
+
+    return render_template("slideshow.html", app_name=APP_NAME, user=None, items=items)
+
 @app.post("/modify_rendering/<int:rid>")
 def modify_rendering(rid):
     description = request.form.get("description", "")
@@ -488,12 +498,10 @@ def modify_rendering(rid):
     cur.execute("SELECT * FROM renderings WHERE id=?", (rid,))
     row = cur.fetchone()
     if not row:
-        conn.close()
-        return jsonify({"error": "Rendering not found."}), 404
+        conn.close(); return jsonify({"error": "Rendering not found."}), 404
     
     if row['user_id'] != user_id and (user_id or row['id'] not in guest_ids):
-        conn.close()
-        return jsonify({"error": "Permission denied."}), 403
+        conn.close(); return jsonify({"error": "Permission denied."}), 403
 
     subcategory = row["subcategory"]
     original_options = json.loads(row["options_json"] or "{}")
@@ -503,8 +511,7 @@ def modify_rendering(rid):
     try:
         rel_path = generate_image_via_openai(prompt)
     except Exception as e:
-        conn.close()
-        return jsonify({"error": f"Modification failed: {e}"}), 500
+        conn.close(); return jsonify({"error": f"Modification failed: {e}"}), 500
 
     now = datetime.utcnow().isoformat()
     cur.execute("""
@@ -521,23 +528,18 @@ def modify_rendering(rid):
 
     return jsonify({"id": new_id, "path": url_for('static', filename=rel_path), "subcategory": subcategory, "message": f"Modified {subcategory} rendering!"})
 
-
 # ---------- Auth Routes (Login, Register, Logout) ----------
 @app.route("/register", methods=["GET", "POST"])
-def register():
-    # (Implementation remains the same)
-    pass
+# (Implementation remains the same)
+def register(): pass
 
 @app.route("/login", methods=["GET", "POST"])
-def login():
-    # (Implementation remains the same)
-    pass
+# (Implementation remains the same)
+def login(): pass
 
 @app.get("/logout")
-def logout():
-    # (Implementation remains the same)
-    pass
-
+# (Implementation remains the same)
+def logout(): pass
 
 # ---------- Scaffolding and Main Execution ----------
 def write_template_files_if_missing():
@@ -627,12 +629,9 @@ def write_template_files_if_missing():
     
     # gallery.html
     (TEMPLATES_DIR / "gallery.html").write_text("""{% extends "layout.html" %}
-
 {% from "macros.html" import render_card %}
-
 {% block content %}
 <h1>My Renderings</h1>
-
 {% if new_items %}
 <div class="card">
   <h2>Newly Generated</h2>
@@ -641,7 +640,6 @@ def write_template_files_if_missing():
   </div>
 </div>
 {% endif %}
-
 <div class="card bulk-actions">
     <div class="row space">
         <div>
@@ -653,12 +651,10 @@ def write_template_files_if_missing():
     </div>
     {% if show_slideshow %}<a href="{{ url_for('slideshow') }}" class="button primary">▶️ View Favorites Slideshow</a>{% endif %}
 </div>
-
 <h3>All My Renderings</h3>
 <div id="renderingsGrid" class="grid">
     {% for r in items %}{{ render_card(r, options, user) }}{% endfor %}
 </div>
-
 <div class="card">
     <h2>Generate a New Room</h2>
     <form id="generateRoomForm">
@@ -669,9 +665,7 @@ def write_template_files_if_missing():
         <button type="submit" class="primary">Generate Room</button>
     </form>
 </div>
-
 <div id="imageModal" class="modal"><span class="close-modal">&times;</span><img class="modal-content" id="modalImg"></div>
-
 <script>
     const ROOM_OPTIONS = {{ options | tojson }};
 </script>
@@ -680,27 +674,29 @@ def write_template_files_if_missing():
 
     # session_gallery.html
     (TEMPLATES_DIR / "session_gallery.html").write_text("""{% extends "layout.html" %}
-
 {% from "macros.html" import render_card %}
-
 {% block content %}
 <h1>Your Current Session</h1>
 <div class="card info">
-  <p>These are the renderings you've created in this session. They will be lost when you close your browser.</p>
-  <p><strong><a href="{{ url_for('register') }}">Create an account</a> or <a href="{{ url_for('login') }}">log in</a> to save your work permanently.</strong></p>
+  <p>These are the renderings you've created in this session. They are temporary.</p>
+  <p><strong><a href="{{ url_for('register') }}">Create an account</a> or <a href="{{ url_for('login') }}">log in</a> to save your work.</strong></p>
 </div>
 
 {% if items %}
+  {% if items|length >= 2 %}
+  <div class="card">
+    <a href="{{ url_for('session_slideshow') }}" class="button primary">▶️ Start Slideshow</a>
+  </div>
+  {% endif %}
 <div id="renderingsGrid" class="grid">
     {% for r in items %}{{ render_card(r, options, user) }}{% endfor %}
 </div>
 {% else %}
 <div class="card">
-    <p>You haven't generated any renderings in this session yet. <a href="{{ url_for('index') }}">Start designing!</a></p>
+    <p>You haven't generated any renderings yet. <a href="{{ url_for('index') }}">Start designing!</a></p>
 </div>
 {% endif %}
 
-<!-- FIX: Add the Room Generator to the session page -->
 <div class="card">
     <h2>Generate a New Room</h2>
     <form id="generateRoomForm">
@@ -711,11 +707,43 @@ def write_template_files_if_missing():
         <button type="submit" class="primary">Generate Room</button>
     </form>
 </div>
-
 <div id="imageModal" class="modal"><span class="close-modal">&times;</span><img class="modal-content" id="modalImg"></div>
-
 <script>
     const ROOM_OPTIONS = {{ options | tojson }};
+</script>
+{% endblock %}
+""", encoding="utf-8")
+
+    # slideshow.html
+    (TEMPLATES_DIR / "slideshow.html").write_text("""{% extends "layout.html" %}
+{% block content %}
+<div class="slideshow-container">
+  <h1>Slideshow</h1>
+  <div class="slideshow">
+    {% for r in items %}
+      <div class="slide" {% if not loop.first %}style="display:none;"{% endif %}>
+        <img src="{{ url_for('static', filename=r['image_path']) }}" alt="{{ r['subcategory'] }}">
+        <div class="caption">{{ r['subcategory'] }}</div>
+      </div>
+    {% endfor %}
+  </div>
+  <div class="row gap center">
+    <button id="prev" class="button">❮ Prev</button>
+    <a href="{{ url_for('gallery' if user else 'session_gallery') }}" class="button">Back to Gallery</a>
+    <button id="toggleDark" class="button">Toggle Dark 🌙</button>
+    <button id="next" class="button">Next ❯</button>
+  </div>
+</div>
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  let idx=0;
+  function show(i){slides.forEach((s,j)=>s.style.display=(i===j?'block':'none'));}
+  document.getElementById('prev').onclick=()=>{idx=(idx-1+slides.length)%slides.length;show(idx);}
+  document.getElementById('next').onclick=()=>{idx=(idx+1)%slides.length;show(idx);}
+  document.getElementById('toggleDark').onclick=()=>{
+      const currentImg = slides[idx].querySelector('img');
+      if (currentImg) currentImg.classList.toggle('dark');
+  };
 </script>
 {% endblock %}
 """, encoding="utf-8")
@@ -761,9 +789,7 @@ def write_template_files_if_missing():
 """, encoding="utf-8")
 
 def write_basic_static_if_missing():
-    # CSS needs updates for landing page and badge
     (STATIC_DIR / "app.css").write_text("""
-/* (previous styles...) */
 :root { --bg: #f4f7fa; --text: #1a202c; --card-bg: #fff; --border: #e2e8f0; --primary: #4a6dff; --primary-text: #fff; --hover: #f0f3ff; }
 body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background-color: var(--bg); color: var(--text); line-height: 1.6; }
 .container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
@@ -776,10 +802,8 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Ro
 .button.primary, button.primary { background-color: var(--primary); color: var(--primary-text); }
 .row { display: flex; align-items: center; }
 .gap > * { margin-right: 0.5rem; }
+.center { justify-content: center; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
-/* ... (existing styles) */
-
-/* --- NEW STYLES --- */
 .landing-content { max-width: 1000px; margin: 2rem auto; text-align: center; }
 .landing-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 2rem; text-align: left; margin-top: 2rem; }
 .landing-column .card { height: 100%; box-sizing: border-box; }
@@ -788,11 +812,189 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Ro
 .button-outline { background-color: transparent; border: 1px solid var(--primary); color: var(--primary) !important; padding: 0.5rem 1rem; }
 .badge { background-color: var(--primary); color: var(--primary-text); font-size: 0.75em; padding: 2px 6px; border-radius: 8px; margin-left: 4px; }
 .info { background-color: #bee3f8; color: #2c5282; padding: 1rem; border-radius: 6px; }
+.render-card { position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.render-img { width: 100%; height: auto; display: block; aspect-ratio: 1/1; object-fit: cover; cursor: pointer; }
+.meta { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem; }
+.actions { display: flex; gap: 0.5rem; }
+.action-btn { background: none; border: none; font-size: 1.2rem; cursor: pointer; padding: 0; }
+.action-btn.active, .fav-btn.active { color: #fdd835; }
+.dark-toggle { font-size: 1.2rem; }
+.rendering-checkbox { position: absolute; top: 10px; left: 10px; width: 20px; height: 20px; z-index: 10; }
+.modify-section details { margin-top: 0.5rem; }
+.options-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 1rem; }
+.modal { display: none; position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.9); }
+.modal-content { margin: auto; display: block; max-width: 90%; max-height: 90%; }
+.close-modal { position: absolute; top: 15px; right: 35px; color: #f1f1f1; font-size: 40px; font-weight: bold; cursor: pointer; }
+.slideshow-container, .slide { text-align: center; }
+.slide img { max-width: 100%; max-height: 70vh; border-radius: 8px; }
+.flash { padding: 1rem; margin-bottom: 1rem; border-radius: 6px; }
+.flash.success { background-color: #c6f6d5; color: #22543d; }
+.flash.danger { background-color: #fed7d7; color: #822727; }
 
 @media (max-width: 768px) { .landing-grid { grid-template-columns: 1fr; } }
     """, encoding="utf-8")
     
-    # (JS and other static files can remain the same)
+    (STATIC_DIR / "app.js").write_text("""
+document.addEventListener('DOMContentLoaded', function() {
+    // --- Universal Modal Logic ---
+    const modal = document.getElementById('imageModal');
+    if (modal) {
+        document.addEventListener('click', e => {
+            if (e.target.classList.contains('modal-trigger')) {
+                modal.style.display = 'block'; document.getElementById('modalImg').src = e.target.src;
+            }
+            if (e.target.classList.contains('close-modal')) {
+                modal.style.display = 'none';
+            }
+        });
+        window.addEventListener('click', e => { if (e.target === modal) modal.style.display = 'none'; });
+    }
+
+    // --- Voice Prompt on Index Page ---
+    const voiceBtn = document.getElementById('voiceBtn');
+    if (voiceBtn) {
+        const description = document.getElementById('description');
+        const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SpeechRecognition) {
+            const recognition = new SpeechRecognition();
+            recognition.onresult = (event) => { description.value = event.results[0][0].transcript; };
+            voiceBtn.addEventListener('click', () => recognition.start());
+        } else {
+            voiceBtn.style.display = 'none';
+        }
+    }
+    
+    // --- Gallery / Session Gallery Page Logic ---
+    const gridContainer = document.getElementById('renderingsGrid');
+    if (gridContainer) {
+        
+        // --- FIX: Room option population logic ---
+        const roomForm = document.getElementById('generateRoomForm');
+        const roomSelect = document.getElementById('roomSelect');
+        const roomOptionsContainer = document.getElementById('roomOptionsContainer');
+        
+        function updateRoomOptions() {
+            const subcategory = roomSelect.value;
+            const options = ROOM_OPTIONS[subcategory];
+            roomOptionsContainer.innerHTML = ''; // Clear previous options
+            if (options) {
+                const container = document.createElement('div');
+                container.className = 'options-grid';
+                for (const [opt, vals] of Object.entries(options)) {
+                    const label = document.createElement('label');
+                    label.textContent = opt;
+                    const select = document.createElement('select');
+                    select.name = opt;
+                    vals.forEach(v => {
+                        const option = document.createElement('option');
+                        option.value = v;
+                        option.textContent = v;
+                        select.appendChild(option);
+                    });
+                    label.appendChild(select);
+                    container.appendChild(label);
+                }
+                roomOptionsContainer.appendChild(container);
+            }
+        }
+        
+        if (roomSelect) {
+            roomSelect.addEventListener('change', updateRoomOptions);
+            updateRoomOptions(); // Initial call to populate on page load
+        }
+        
+        // Event delegation for all card actions
+        document.body.addEventListener('submit', handleFormSubmit);
+        document.body.addEventListener('click', handleCardClick);
+    }
+});
+
+function handleFormSubmit(e) {
+    if (e.target.classList.contains('modify-form')) {
+        e.preventDefault();
+        modifyRendering(e.target);
+    }
+    if (e.target.id === 'generateRoomForm') {
+        e.preventDefault();
+        generateNewRoom(e.target);
+    }
+}
+
+function handleCardClick(e) {
+    const card = e.target.closest('.render-card');
+    if (!card) return;
+
+    if (e.target.classList.contains('like-btn') || e.target.classList.contains('fav-btn')) {
+        if (requireLogin('save likes and favorites')) return;
+        const action = e.target.classList.contains('like-btn') ? 'like' : 'favorite';
+        handleBulkAction(action, [card.dataset.id]).then(() => e.target.classList.toggle('active'));
+    } else if (e.target.classList.contains('dark-toggle')) {
+        card.querySelector('.render-img').classList.toggle('dark');
+    }
+}
+
+async function modifyRendering(form) {
+    const id = form.dataset.id;
+    const formData = new FormData(form);
+    const button = form.querySelector('button');
+    button.textContent = 'Generating...';
+    button.disabled = true;
+
+    try {
+        const response = await fetch(`/modify_rendering/${id}`, { method: 'POST', body: formData });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error);
+        showFlash(result.message, 'success');
+        // Simple reload is the easiest way to show the new image in the right place
+        window.location.reload(); 
+    } catch (error) {
+        showFlash(error.message, 'danger');
+    } finally {
+        button.textContent = 'Regenerate';
+        button.disabled = false;
+    }
+}
+
+async function generateNewRoom(form) {
+    const formData = new FormData(form);
+    const button = form.querySelector('button');
+    button.textContent = 'Generating...';
+    button.disabled = true;
+
+    try {
+        const response = await fetch('/generate_room', { method: 'POST', body: formData });
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error);
+        showFlash(result.message, 'success');
+        // Simple reload to show the new room in the gallery
+        window.location.reload();
+    } catch (error) {
+        showFlash(error.message, 'danger');
+    } finally {
+        button.textContent = 'Generate Room';
+        button.disabled = false;
+    }
+}
+
+function requireLogin(action_text = 'save your work') {
+    if (!IS_LOGGED_IN) {
+        if (confirm(`Please log in or register to ${action_text}. Would you like to go to the login page?`)) {
+            window.location.href = '/login?next=' + window.location.pathname;
+        }
+        return true;
+    }
+    return false;
+}
+
+function showFlash(message, category) {
+    const container = document.getElementById('flash-container');
+    const flash = document.createElement('div');
+    flash.className = `flash ${category}`;
+    flash.textContent = message;
+    container.prepend(flash);
+    setTimeout(() => flash.remove(), 5000);
+}
+""", encoding="utf-8")
 
 
 if __name__ == "__main__":
