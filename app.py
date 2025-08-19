@@ -529,7 +529,7 @@ def gallery():
     conn.close()
 
     fav_count = sum(1 for r in items if r["favorited"])
-     return redirect(url_for("gallery"))
+    return redirect(url_for("gallery"))
 
 @app.post("/bulk_action")
 def bulk_action():
@@ -1000,6 +1000,7 @@ def write_basic_static_if_missing():
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
