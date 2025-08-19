@@ -507,8 +507,14 @@ def gallery():
     items = [dict(row) for row in cur.fetchall()]
     conn.close()
 
-    # Determine which rooms to show for generation
-    # This might need a better way to get the original description
+    # --- FIX ---
+    # Parse the JSON string into a dictionary here, in the Python code
+    for item in items:
+        try:
+            item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
+        except (json.JSONDecodeError, TypeError):
+            item['options_dict'] = {} # Use an empty dict if JSON is invalid or null
+    
     all_rooms = build_room_list("") # Assuming no basement by default on gallery load
     
     fav_count = sum(1 for r in items if r["favorited"])
@@ -838,7 +844,8 @@ def write_template_files_if_missing():
                       {% for opt, vals in options[r['subcategory']].items() %}
                       <label>{{ opt }}
                         <select name="{{ opt }}">
-                          {% set current_val = (r['options_json'] | fromjson)[opt] %}
+                          {# --- FIX --- Use the pre-parsed 'options_dict' and .get() for safety #}
+                          {% set current_val = r['options_dict'].get(opt) %}
                           <option value="">-- Default --</option>
                           {% for v in vals %}
                           <option value="{{ v }}" {% if v == current_val %}selected{% endif %}>{{ v }}</option>
