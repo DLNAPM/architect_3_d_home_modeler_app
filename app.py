@@ -51,6 +51,7 @@ from PIL import Image
 from email.message import EmailMessage
 import smtplib
 
+
 # ---------- Config ----------
 APP_NAME = "Architect 3D Home Modeler"
 BASE_DIR = Path(__file__).resolve().parent
@@ -92,6 +93,34 @@ except Exception as e:
     print("OpenAI SDK not available yet:", e)
 
 # ---------- Helpers ----------
+
+def determine_rooms(description: str, file=None):
+    """
+    Decide what room categories to include based on user description or uploaded plan.
+    Always includes the core rooms, and if 'basement' is mentioned, include basement-specific rooms.
+    """
+    rooms = [
+        "Living Room",
+        "Kitchen",
+        "Home Office",
+        "Family Room",
+        "Primary Bedroom",
+        "Primary Bathroom",
+        "Bedroom2",
+        "Bedroom3",
+    ]
+
+    # If user mentions basement, add extra spaces
+    desc_lower = description.lower()
+    if "basement" in desc_lower:
+        rooms.extend([
+            "Basement w/ Bar",
+            "Theater Room",
+            "Exercise Room",
+            "Steam Room",
+        ])
+
+    return rooms
 
 def init_fs_once():
     """Make sure folders & templates exist once."""
@@ -1000,6 +1029,7 @@ def write_basic_static_if_missing():
 if __name__ == "__main__":
     # For local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+
 
 
 
