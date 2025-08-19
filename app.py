@@ -10,13 +10,13 @@ Architect 3D Home Modeler – Flask 3.x single-file app
 - Dark mode toggle per rendering (CSS filter)
 - @app.before_request + guard for one-time init (Flask 3.x safe)
 - Auto-scaffold templates/ and static/ on first run
-# ---------Recent Updates 08202025 -----------
+# ---------Recent Updates 08202025 v2 -----------
+- FIXED: Corrected layout for newly generated exteriors to be full-featured and not duplicated.
+- FIXED: Restored the "Generate a New Room" section to all gallery views.
+- FIXED: The "Modify Rendering" button is now fully functional.
 - Redesigned landing page to match professional layout.
 - Created a dedicated page for guest/session renderings.
 - Added a conditional "View Session" button to the main navigation.
-- FIXED: Restored the "Generate a New Room" section to the gallery page.
-- Login is now only required to save (like/favorite) renderings.
-- Exteriors can be modified immediately after generation.
 """
 
 import os
@@ -368,6 +368,8 @@ def generate():
             return redirect(url_for("index"))
     
     conn.close()
+    
+    # Store IDs in session for both guests and logged-in users to highlight new images
     session['new_rendering_ids'] = new_rendering_ids
     if not user_id:
         guest_ids = session.get('guest_rendering_ids', [])
@@ -375,7 +377,8 @@ def generate():
         session['guest_rendering_ids'] = guest_ids
 
     flash("Generated Front & Back exterior renderings!", "success")
-    return redirect(url_for("gallery"))
+    # Redirect to the correct gallery based on login status
+    return redirect(url_for("gallery" if user_id else "session_gallery"))
 
 @app.post("/generate_room")
 def generate_room():
@@ -412,26 +415,27 @@ def generate_room():
 def gallery():
     user = current_user()
     if not user:
-        # If not logged in, redirect to the session gallery
         return redirect(url_for('session_gallery'))
 
-    items, new_items = [], []
     conn = get_db()
     cur = conn.cursor()
     
     cur.execute("SELECT * FROM renderings WHERE user_id = ? ORDER BY created_at DESC", (user["id"],))
-    items = [dict(row) for row in cur.fetchall()]
-    new_ids = session.pop('new_rendering_ids', [])
-    new_items = [item for item in items if item['id'] in new_ids]
-        
+    all_items = [dict(row) for row in cur.fetchall()]
     conn.close()
     
-    for item in items: item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
+    new_ids = session.pop('new_rendering_ids', [])
+    new_items = [item for item in all_items if item['id'] in new_ids]
+    
+    # --- FIX --- Exclude new items from the main list to prevent duplication on the same page load
+    main_items = [item for item in all_items if item['id'] not in new_ids]
+    
+    for item in all_items: item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
 
-    fav_count = sum(1 for r in items if r.get("favorited"))
-    all_rooms = build_room_list("")
+    fav_count = sum(1 for r in main_items if r.get("favorited"))
+    all_rooms = build_room_list("") # Pass the room list to the template
 
-    return render_template("gallery.html", app_name=APP_NAME, user=user, items=items,
+    return render_template("gallery.html", app_name=APP_NAME, user=user, items=main_items,
                            new_items=new_items, show_slideshow=(fav_count >= 2),
                            rooms=all_rooms, options=OPTIONS)
 
@@ -439,7 +443,7 @@ def gallery():
 def session_gallery():
     user = current_user()
     if user:
-        return redirect(url_for('gallery')) # Logged-in users shouldn't be here
+        return redirect(url_for('gallery'))
 
     items = []
     guest_ids = session.get('guest_rendering_ids', [])
@@ -452,8 +456,12 @@ def session_gallery():
         conn.close()
         
     for item in items: item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
+    
+    # --- FIX --- Pass room list to the session gallery template
+    all_rooms = build_room_list("")
 
-    return render_template("session_gallery.html", app_name=APP_NAME, user=user, items=items, options=OPTIONS)
+    return render_template("session_gallery.html", app_name=APP_NAME, user=user, items=items, 
+                           options=OPTIONS, rooms=all_rooms)
 
 @app.post("/bulk_action")
 @login_required
@@ -467,10 +475,52 @@ def slideshow():
     # (Implementation remains the same)
     pass
 
+# --- CRITICAL FIX --- The route decorator and function signature were incorrect.
 @app.post("/modify_rendering/<int:rid>")
-def modify_rendering():
-    # (Implementation remains the same)
-    pass
+def modify_rendering(rid):
+    description = request.form.get("description", "")
+    conn = get_db()
+    cur = conn.cursor()
+    
+    user_id = session.get("user_id")
+    guest_ids = session.get('guest_rendering_ids', [])
+    
+    cur.execute("SELECT * FROM renderings WHERE id=?", (rid,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return jsonify({"error": "Rendering not found."}), 404
+    
+    if row['user_id'] != user_id and (user_id or row['id'] not in guest_ids):
+        conn.close()
+        return jsonify({"error": "Permission denied."}), 403
+
+    subcategory = row["subcategory"]
+    original_options = json.loads(row["options_json"] or "{}")
+    selected = {opt: request.form.get(opt) or original_options.get(opt) for opt in OPTIONS.get(subcategory, {}).keys()}
+
+    prompt = build_prompt(subcategory, selected, description, False)
+    try:
+        rel_path = generate_image_via_openai(prompt)
+    except Exception as e:
+        conn.close()
+        return jsonify({"error": f"Modification failed: {e}"}), 500
+
+    now = datetime.utcnow().isoformat()
+    cur.execute("""
+        INSERT INTO renderings (user_id, category, subcategory, options_json, prompt, image_path, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_id, row["category"], subcategory, json.dumps(selected), prompt, rel_path, now))
+    conn.commit()
+    new_id = cur.lastrowid
+    conn.close()
+    
+    if not user_id:
+        guest_ids.append(new_id)
+        session['guest_rendering_ids'] = guest_ids
+
+    return jsonify({"id": new_id, "path": url_for('static', filename=rel_path), "subcategory": subcategory, "message": f"Modified {subcategory} rendering!"})
+
 
 # ---------- Auth Routes (Login, Register, Logout) ----------
 @app.route("/register", methods=["GET", "POST"])
@@ -609,7 +659,6 @@ def write_template_files_if_missing():
     {% for r in items %}{{ render_card(r, options, user) }}{% endfor %}
 </div>
 
-<!-- BUG FIX: This section is now correctly displayed -->
 <div class="card">
     <h2>Generate a New Room</h2>
     <form id="generateRoomForm">
@@ -629,7 +678,7 @@ def write_template_files_if_missing():
 {% endblock %}
 """, encoding="utf-8")
 
-    # NEW: session_gallery.html
+    # session_gallery.html
     (TEMPLATES_DIR / "session_gallery.html").write_text("""{% extends "layout.html" %}
 
 {% from "macros.html" import render_card %}
@@ -651,11 +700,27 @@ def write_template_files_if_missing():
 </div>
 {% endif %}
 
+<!-- FIX: Add the Room Generator to the session page -->
+<div class="card">
+    <h2>Generate a New Room</h2>
+    <form id="generateRoomForm">
+        <select id="roomSelect" name="subcategory">
+            {% for room in rooms %}<option value="{{ room }}">{{ room }}</option>{% endfor %}
+        </select>
+        <div id="roomOptionsContainer"></div>
+        <button type="submit" class="primary">Generate Room</button>
+    </form>
+</div>
+
 <div id="imageModal" class="modal"><span class="close-modal">&times;</span><img class="modal-content" id="modalImg"></div>
+
+<script>
+    const ROOM_OPTIONS = {{ options | tojson }};
+</script>
 {% endblock %}
 """, encoding="utf-8")
 
-    # NEW: macros.html for the reusable card
+    # macros.html
     (TEMPLATES_DIR / "macros.html").write_text("""
 {% macro render_card(r, options, user) %}
 <div class="render-card" data-id="{{ r['id'] }}">
@@ -704,6 +769,7 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Ro
 .container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
 .topbar { display: flex; justify-content: space-between; align-items: center; padding: 1rem; border-bottom: 1px solid var(--border); background-color: var(--card-bg); }
 .brand { font-weight: bold; text-decoration: none; color: var(--text); }
+.nav { display: flex; align-items: center; }
 .nav a { margin-left: 1rem; text-decoration: none; color: var(--text); }
 .card { background-color: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; }
 .button, button { background-color: #e2e8f0; color: #2d3748; border: none; padding: 0.75rem 1rem; border-radius: 6px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
@@ -716,10 +782,10 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Ro
 /* --- NEW STYLES --- */
 .landing-content { max-width: 1000px; margin: 2rem auto; text-align: center; }
 .landing-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 2rem; text-align: left; margin-top: 2rem; }
-.landing-column .card { height: 100%; }
+.landing-column .card { height: 100%; box-sizing: border-box; }
 .pill-list { list-style: none; padding: 0; display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .pill-list li { background: #edf2f7; padding: 0.25rem 0.75rem; border-radius: 99px; font-size: 0.9em; }
-.button-outline { background-color: transparent; border: 1px solid var(--primary); color: var(--primary); padding: 0.5rem 1rem; }
+.button-outline { background-color: transparent; border: 1px solid var(--primary); color: var(--primary) !important; padding: 0.5rem 1rem; }
 .badge { background-color: var(--primary); color: var(--primary-text); font-size: 0.75em; padding: 2px 6px; border-radius: 8px; margin-left: 4px; }
 .info { background-color: #bee3f8; color: #2c5282; padding: 1rem; border-radius: 6px; }
 
