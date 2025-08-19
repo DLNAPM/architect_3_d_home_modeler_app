@@ -10,7 +10,9 @@ Architect 3D Home Modeler – Flask 3.x single-file app
 - Dark mode toggle per rendering (CSS filter)
 - @app.before_request + guard for one-time init (Flask 3.x safe)
 - Auto-scaffold templates/ and static/ on first run
-# ---------Recent Updates 08212025 -----------
+# ---------Recent Updates 08222025 -----------
+- ADDED: Logic to prevent swimming pools in Front Exterior renderings.
+- ADDED: Basement rooms now only appear if "basement" is in the initial description.
 - ADDED: A "Please hold" loading overlay when generating initial exteriors.
 - ENABLED: The night/dark mode toggle button on all renderings is now functional.
 - FIXED: Corrected layout for newly generated exteriors to prevent stacking.
@@ -23,6 +25,7 @@ import sqlite3
 import uuid
 import json
 import base64
+import re
 from datetime import datetime
 from functools import wraps
 from pathlib import Path
@@ -290,17 +293,22 @@ BASIC_ROOMS = ["Living Room", "Kitchen", "Home Office", "Primary Bedroom", "Prim
 BASEMENT_ROOMS = ["Basement: Game Room", "Basement: Gym", "Basement: Theater Room", "Basement: Hallway"]
 
 def build_room_list(description: str):
+    """Dynamically creates a list of rooms based on the home description."""
     rooms = BASIC_ROOMS.copy()
     if "basement" in (description or "").lower():
-        rooms += BASEMENT_ROOMS
+        rooms.extend(BASEMENT_ROOMS)
     return rooms
 
 def build_prompt(subcategory: str, options_map: dict, description: str, plan_uploaded: bool):
+    """Builds the final prompt for the AI, enforcing specific rules."""
     selections = ", ".join([f"{k}: {v}" for k, v in options_map.items() if v and v not in ["None", ""]])
     plan_hint = "Consider the uploaded architectural plan as a guide. " if plan_uploaded else ""
+    
+    # --- RULE --- If it's a Front Exterior, remove any mention of pools.
     if subcategory == "Front Exterior":
-        description = description.replace("pool", "")
+        description = re.sub(r'swimming pool|pool', '', description, flags=re.IGNORECASE)
         selections = ", ".join([s for s in selections.split(", ") if "pool" not in s.lower()])
+
     base = (f"High-quality photorealistic {subcategory} rendering for a residential home. "
             f"{plan_hint}"
             f"Design intent: {description.strip() or 'Client unspecified style; pick tasteful contemporary.'} "
@@ -343,6 +351,9 @@ def generate():
     plan_uploaded = bool(plan_file and plan_file.filename)
     if plan_uploaded:
         (UPLOAD_DIR / f"{uuid.uuid4().hex}_{plan_file.filename}").write_bytes(plan_file.read())
+
+    # --- LOGIC --- Determine and save the available rooms based on the description
+    session['available_rooms'] = build_room_list(description)
 
     user_id = session.get("user_id")
     new_rendering_ids = []
@@ -428,7 +439,7 @@ def gallery():
     for item in all_items: item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
 
     fav_count = sum(1 for r in main_items if r.get("favorited"))
-    all_rooms = build_room_list("")
+    all_rooms = session.get('available_rooms', build_room_list(""))
 
     return render_template("gallery.html", app_name=APP_NAME, user=user, items=main_items,
                            new_items=new_items, show_slideshow=(fav_count >= 2),
@@ -452,7 +463,7 @@ def session_gallery():
         
     for item in items: item['options_dict'] = json.loads(item.get('options_json', '{}') or '{}')
     
-    all_rooms = build_room_list("")
+    all_rooms = session.get('available_rooms', build_room_list(""))
 
     return render_template("session_gallery.html", app_name=APP_NAME, user=user, items=items, 
                            options=OPTIONS, rooms=all_rooms)
@@ -610,7 +621,7 @@ def write_template_files_if_missing():
     <div class="landing-column">
       <form class="card" id="generateForm" action="{{ url_for('generate') }}" method="post" enctype="multipart/form-data">
         <h2>1. Describe Your Home</h2>
-        <textarea id="description" name="description" rows="8" placeholder="e.g., A two-story modern farmhouse with a wrap-around porch, black metal roof, and large windows. Include a lush garden and a stone pathway..."></textarea>
+        <textarea id="description" name="description" rows="8" placeholder="e.g., A two-story modern farmhouse with a wrap-around porch, black metal roof, and a finished basement..."></textarea>
         <div class="row gap">
           <button type="button" id="voiceBtn" class="button">🎤 Use Voice</button>
           <label class="file-label">
@@ -822,7 +833,7 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Ro
 .info { background-color: #bee3f8; color: #2c5282; padding: 1rem; border-radius: 6px; }
 .render-card { position: relative; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 .render-img { width: 100%; height: auto; display: block; aspect-ratio: 1/1; object-fit: cover; cursor: pointer; }
-.render-img.dark { filter: invert(1) hue-rotate(180deg); }
+.render-img.dark { filter: brightness(0.6) contrast(1.2); }
 .meta { display: flex; justify-content: space-between; align-items: center; padding: 0.5rem; }
 .actions { display: flex; gap: 0.5rem; }
 .action-btn { background: none; border: none; font-size: 1.2rem; cursor: pointer; padding: 0; }
@@ -838,7 +849,7 @@ body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Ro
 .flash { padding: 1rem; margin-bottom: 1rem; border-radius: 6px; }
 .flash.success { background-color: #c6f6d5; color: #22543d; }
 .flash.danger { background-color: #fed7d7; color: #822727; }
-#loadingOverlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 9999; color: white; text-align: center; justify-content: center; align-items: center; }
+#loadingOverlay { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 9999; color: white; text-align: center; justify-content: center; align-items: center; flex-direction: column; }
 .loading-content { background: #333; padding: 2rem; border-radius: 8px; }
 @media (max-width: 768px) { .landing-grid { grid-template-columns: 1fr; } }
     """, encoding="utf-8")
@@ -957,6 +968,7 @@ async function modifyRendering(form) {
     const button = form.querySelector('button');
     button.textContent = 'Generating...';
     button.disabled = true;
+    document.getElementById('loadingOverlay').style.display = 'flex';
 
     try {
         const response = await fetch(`/modify_rendering/${id}`, { method: 'POST', body: formData });
@@ -966,6 +978,7 @@ async function modifyRendering(form) {
         setTimeout(() => window.location.reload(), 1500);
     } catch (error) {
         showFlash(error.message, 'danger');
+        document.getElementById('loadingOverlay').style.display = 'none';
     } finally {
         button.textContent = 'Regenerate';
         button.disabled = false;
@@ -977,6 +990,7 @@ async function generateNewRoom(form) {
     const button = form.querySelector('button');
     button.textContent = 'Generating...';
     button.disabled = true;
+    document.getElementById('loadingOverlay').style.display = 'flex';
 
     try {
         const response = await fetch('/generate_room', { method: 'POST', body: formData });
@@ -986,6 +1000,7 @@ async function generateNewRoom(form) {
         setTimeout(() => window.location.reload(), 1500);
     } catch (error) {
         showFlash(error.message, 'danger');
+        document.getElementById('loadingOverlay').style.display = 'none';
     } finally {
         button.textContent = 'Generate Room';
         button.disabled = false;
